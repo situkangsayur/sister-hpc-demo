@@ -1,0 +1,18 @@
+# APISIX mode standalone: route dibaca dari conf/apisix.yaml, tanpa etcd dan tanpa Admin API.
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+
+apisix:
+  node_listen: 9080
+  enable_ipv6: false
+  enable_control: false
+
+nginx_config:
+  error_log_level: warn
+  worker_processes: 2   # cukup untuk demo, hemat memori
+  http:
+    # Log akses JSON satu baris agar mudah dibaca di Loki (field request_id ikut).
+    access_log_format: '{"time":"$time_iso8601","level":"INFO","msg":"apisix access","service":"apisix","request_id":"$http_x_request_id","method":"$request_method","path":"$uri","status":$status,"upstream":"$upstream_addr","duration_ms":"$request_time"}'
+    access_log_format_escape: json

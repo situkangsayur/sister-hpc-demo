@@ -1,0 +1,191 @@
+name: sister-bab05
+
+# Satu image Go untuk semua service (hemat disk); binary dipilih lewat command.
+x-go: &go
+  build: ./services
+  image: sister-bab05-svc:dev
+  restart: unless-stopped
+  depends_on: &godeps
+    postgres: { condition: service_healthy }
+    nats: { condition: service_healthy }
+
+x-health: &health
+  interval: 3s
+  timeout: 2s
+  retries: 40
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sister
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+    ports: ["${BIND_ADDR:-127.0.0.1}:50506:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sister && psql -U sister -d notification -c 'select 1' >/dev/null"]
+      <<: *health
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222", "-n", "sister-bab05"]
+    volumes: ["natsdata:/data"]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50504:4222"
+      - "${BIND_ADDR:-127.0.0.1}:50503:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      <<: *health
+
+  opensearch-1: &os
+    image: opensearchproject/opensearch:2.19.1
+    environment: &osenv
+      cluster.name: sister-bab05
+      node.name: opensearch-1
+      discovery.seed_hosts: opensearch-1,opensearch-2
+      cluster.initial_cluster_manager_nodes: opensearch-1,opensearch-2
+      bootstrap.memory_lock: "false"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      # Security plugin dimatikan HANYA untuk demo lokal (lihat README).
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    mem_limit: 1100m
+    restart: unless-stopped
+    volumes: ["os1:/usr/share/opensearch/data"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50505:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  opensearch-2:
+    <<: *os
+    environment:
+      <<: *osenv
+      node.name: opensearch-2
+    volumes: ["os2:/usr/share/opensearch/data"]
+    ports: []
+
+  catalog:
+    <<: *go
+    command: ["catalog"]
+    environment:
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/catalog
+      OPENSEARCH_URLS: http://opensearch-1:9200,http://opensearch-2:9200
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  inventory:
+    <<: *go
+    command: ["inventory"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/inventory
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  payment:
+    <<: *go
+    command: ["payment"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/payment
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  notification:
+    <<: *go
+    command: ["notification"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/notification
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  order-1: &order
+    <<: *go
+    command: ["order"]
+    environment: &orderenv
+      NATS_URL: nats://nats:4222
+      REPLICA: order-1
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/orders
+      CATALOG_URL: http://catalog:8080
+      INVENTORY_URL: http://inventory:8080
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      <<: *health
+
+  order-2:
+    <<: *order
+    environment:
+      <<: *orderenv
+      REPLICA: order-2
+
+  order-lb:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on:
+      order-1: { condition: service_healthy }
+      order-2: { condition: service_healthy }
+    ports: ["${BIND_ADDR:-127.0.0.1}:50502:80"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      <<: *health
+
+  monitor:
+    <<: *go
+    command: ["monitor"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/postgres
+      OPENSEARCH_URLS: http://opensearch-1:9200,http://opensearch-2:9200
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  apisix:
+    image: apache/apisix:3.11.0-debian
+    restart: unless-stopped
+    environment:
+      APISIX_KEY: ${APISIX_KEY:-changeme-storefront-key}
+    entrypoint: ["/bin/sh", "/tpl/start.sh"]
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix/apisix.yaml.tpl:/tpl/apisix.yaml.tpl:ro
+      - ./apisix/start.sh:/tpl/start.sh:ro
+    depends_on:
+      order-lb: { condition: service_healthy }
+      catalog: { condition: service_healthy }
+      inventory: { condition: service_healthy }
+      monitor: { condition: service_healthy }
+    ports: ["${BIND_ADDR:-127.0.0.1}:50501:9080"]
+
+  ui:
+    build: ./ui
+    image: sister-bab05-ui:dev
+    restart: unless-stopped
+    environment:
+      GATEWAY_URL: http://apisix:9080
+      APISIX_KEY: ${APISIX_KEY:-changeme-storefront-key}
+    depends_on: [apisix]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50500:3000"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      <<: *health
+
+volumes:
+  pgdata:
+  natsdata:
+  os1:
+  os2:
