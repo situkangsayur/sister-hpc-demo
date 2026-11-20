@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GraphiQL Katalog</title>
+  <link rel="stylesheet" href="vendor/graphiql.min.css">
+  <style>html, body, #graphiql { height: 100%; margin: 0; }</style>
+</head>
+<body>
+  <div id="graphiql"></div>
+  <script src="vendor/react.production.min.js"></script>
+  <script src="vendor/react-dom.production.min.js"></script>
+  <script src="vendor/graphiql.min.js"></script>
+  <script>
+    const contoh = `# Ctrl+Enter untuk menjalankan. Coba buka tab Headers dan isi
+#   {"X-DataLoader": "on", "X-Debug-Extensions": "on"}
+# lalu bandingkan extensions.sql_queries dengan dan tanpa DataLoader.
+query SatuProduk {
+  produk(id: 42) { id nama harga }
+}
+
+query DaftarDenganPenjual {
+  daftarProduk { id nama penjual { nama kota } }
+}
+
+mutation UbahHarga {
+  ubahHarga(id: 42, harga: 26000) { id nama harga }
+}
+`;
+    ReactDOM.createRoot(document.getElementById("graphiql")).render(
+      React.createElement(GraphiQL, {
+        fetcher: GraphiQL.createFetcher({ url: "../graphql" }),
+        defaultQuery: contoh,
+        defaultHeaders: '{"X-Debug-Extensions": "on"}',
+      }),
+    );
+  </script>
+</body>
+</html>

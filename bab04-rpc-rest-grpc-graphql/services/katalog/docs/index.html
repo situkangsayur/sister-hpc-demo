@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dokumentasi API Katalog</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 16px; color: #1f2933; background: #fff; }
+    table { border-collapse: collapse; width: 100%; } td, th { border-bottom: 1px solid #ddd; padding: .5rem; text-align: left; }
+    code { background: #f3f4f6; padding: 0 .25rem; }
+  </style>
+</head>
+<body>
+  <h1>Dokumentasi API Katalog (Bab 4)</h1>
+  <p>Satu layanan katalog, dilayani lewat beberapa protokol. Semua tautan di bawah lewat APISIX.</p>
+  <table>
+    <thead><tr><th>Protokol</th><th>Alat</th><th>Kontrak</th></tr></thead>
+    <tbody>
+      <tr><td>REST JSON / XML</td><td><a href="swagger.html">Swagger UI</a></td><td><a href="openapi.yaml">openapi.yaml</a></td></tr>
+      <tr><td>SOAP 1.1</td><td><code>POST /soap</code></td><td><a href="../soap?wsdl">WSDL</a></td></tr>
+      <tr><td>GraphQL</td><td><a href="graphiql.html">GraphiQL</a></td><td>introspection</td></tr>
+      <tr><td>gRPC</td><td>grpcui (port 50403)</td><td>server reflection, <code>katalog.proto</code></td></tr>
+    </tbody>
+  </table>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# APISIX mode standalone: konfigurasi route dibaca dari apisix.yaml, tanpa etcd
+# dan tanpa Admin API.
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+apisix:
+  node_listen:
+    - 9080          # HTTP/1.1 dan HTTP/2 cleartext (h2c) untuk gRPC di port yang sama
+  enable_http2: true
+  enable_admin: false
+  enable_ipv6: false
+nginx_config:
+  error_log_level: warn
+  worker_processes: 2
+  # izinkan worker membaca env untuk ${{APISIX_DEMO_KEY}} di apisix.yaml
+  envs:
+    - APISIX_DEMO_KEY

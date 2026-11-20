@@ -1,0 +1,105 @@
+# Bab 4 (slide P04): RPC, REST, XML/SOAP, gRPC, GraphQL, real-time, API gateway.
+# Jalankan: cp .env.example .env && docker compose up -d --build
+# UI: http://${BIND_ADDR}:50400
+name: sister-bab04
+
+x-katalog: &katalog
+  build: { context: ./services, args: { TARGET: katalog } }
+  image: sister-bab04-katalog:1.0
+  environment: &katalog-env
+    DATABASE_URL: postgres://katalog:${POSTGRES_PASSWORD:-changeme}@postgres:5432/katalog?sslmode=disable
+  depends_on:
+    postgres: { condition: service_healthy }
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: katalog
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: katalog
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U katalog -d katalog"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  # Dua replica service katalog di belakang APISIX (round robin).
+  katalog-1:
+    <<: *katalog
+    environment:
+      <<: *katalog-env
+      NODE_NAME: katalog-1
+  katalog-2:
+    <<: *katalog
+    environment:
+      <<: *katalog-env
+      NODE_NAME: katalog-2
+
+  # Pemanggil yang dipakai UI: mengukur setiap protokol dari tempat yang sama.
+  klien:
+    build: { context: ./services, args: { TARGET: klien } }
+    image: sister-bab04-klien:1.0
+    environment:
+      GATEWAY_HTTP: http://apisix:9080
+      GATEWAY_GRPC: apisix:9080
+      LANGSUNG_HTTP: http://katalog-1:8080
+      LANGSUNG_GRPC: katalog-1:50051
+      KATALOG_NODES: http://katalog-1:8080,http://katalog-2:8080
+      APISIX_DEMO_KEY: ${APISIX_DEMO_KEY:-changeme-demo-key}
+    depends_on:
+      katalog-1: { condition: service_healthy }
+      katalog-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  apisix:
+    image: apache/apisix:3.11.0-debian
+    environment:
+      APISIX_DEMO_KEY: ${APISIX_DEMO_KEY:-changeme-demo-key}
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50401:9080"   # HTTP/1.1 + h2c (gRPC)
+    depends_on:
+      katalog-1: { condition: service_healthy }
+      katalog-2: { condition: service_healthy }
+    restart: unless-stopped
+
+  # grpcui: UI web untuk gRPC, memakai server reflection lewat APISIX.
+  grpcui:
+    image: fullstorydev/grpcui:v1.4.3
+    command: ["-plaintext", "-port", "8080", "-bind", "0.0.0.0", "-connect-fail-fast=false", "apisix:9080"]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50403:8080"
+    depends_on: [apisix]
+    restart: unless-stopped
+
+  ui:
+    build: { context: ./ui }
+    image: sister-bab04-ui:1.0
+    environment:
+      KLIEN_URL: http://klien:8080
+      GATEWAY_PORT: "50401"
+      GRPCUI_PORT: "50403"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50400:3000"
+    depends_on:
+      klien: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  pgdata:

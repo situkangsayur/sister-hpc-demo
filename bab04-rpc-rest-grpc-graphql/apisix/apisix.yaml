@@ -1,0 +1,84 @@
+# Route APISIX untuk Bab 4. Satu gateway di depan semua protokol (north-south):
+# REST/XML, SOAP, GraphQL, SSE, WebSocket, gRPC, dan gRPC-Web.
+upstreams:
+  - id: katalog-http
+    type: roundrobin
+    nodes:
+      "katalog-1:8080": 1
+      "katalog-2:8080": 1
+    timeout: { connect: 2, send: 60, read: 60 }
+  - id: katalog-grpc
+    type: roundrobin
+    scheme: grpc
+    nodes:
+      "katalog-1:50051": 1
+      "katalog-2:50051": 1
+
+consumers:
+  - username: mahasiswa
+    plugins:
+      key-auth:
+        key: ${{APISIX_DEMO_KEY}}
+
+global_rules:
+  - id: umum
+    plugins:
+      request-id:            # X-Request-Id diteruskan ke service dan muncul di log Loki
+        header_name: X-Request-Id
+        include_in_response: true
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+
+routes:
+  - id: rest-soap-graphql-docs
+    uris: ["/v1/*", "/soap", "/graphql", "/docs/*", "/healthz"]
+    upstream_id: katalog-http
+
+  - id: sse-harga               # stream panjang: jangan di-buffer
+    uri: /v1/harga/stream
+    upstream_id: katalog-http
+    timeout: { connect: 2, send: 3600, read: 3600 }
+
+  - id: websocket-chat
+    uri: /v1/chat
+    enable_websocket: true
+    upstream_id: katalog-http
+    timeout: { connect: 2, send: 3600, read: 3600 }
+
+  # Route publik: wajib API key (header apikey) dan dibatasi 5 request / 10 detik.
+  - id: publik
+    uri: /publik/*
+    upstream_id: katalog-http
+    plugins:
+      key-auth: {}
+      limit-count:
+        count: 5
+        time_window: 10
+        key_type: var
+        key: consumer_name
+        rejected_code: 429
+        rejected_msg: "rate limit: maksimal 5 request per 10 detik"
+        policy: local
+      proxy-rewrite:
+        regex_uri: ["^/publik/(.*)", "/$1"]
+
+  # gRPC native (HTTP/2): APISIX menyeimbangkan per request, bukan per koneksi.
+  - id: grpc
+    uris:
+      - /katalog.v1.KatalogService/*
+      - /grpc.health.v1.Health/*
+      - /grpc.reflection.v1.ServerReflection/*
+      - /grpc.reflection.v1alpha.ServerReflection/*
+    upstream_id: katalog-grpc
+    timeout: { connect: 2, send: 3600, read: 3600 }
+
+  # gRPC-Web: browser (HTTP/1.1) -> APISIX menerjemahkan ke gRPC (HTTP/2).
+  - id: grpc-web
+    uri: /grpcweb/*
+    upstream_id: katalog-grpc
+    plugins:
+      grpc-web: {}
+#END

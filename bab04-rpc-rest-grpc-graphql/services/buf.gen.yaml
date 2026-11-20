@@ -1,0 +1,9 @@
+# Pembangkitan kode Go dari proto/ ke gen/ (plugin lokal: protoc-gen-go, protoc-gen-go-grpc).
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: module=sister/bab04/gen
+  - local: protoc-gen-go-grpc
+    out: gen
+    opt: module=sister/bab04/gen

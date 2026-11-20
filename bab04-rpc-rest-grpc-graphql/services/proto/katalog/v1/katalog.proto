@@ -1,0 +1,62 @@
+// Kontrak gRPC layanan katalog Bab 4. Nomor field Produk sengaja sama dengan
+// slide P04 (id=1, nama=2, harga=3) agar produk 42 "Kopi" 25000 menjadi 12 byte.
+syntax = "proto3";
+package katalog.v1;
+option go_package = "sister/bab04/gen/katalogv1";
+
+service KatalogService {
+  // Unary: satu request, satu response.
+  rpc AmbilProduk(AmbilProdukRequest) returns (Produk);
+  rpc DaftarProduk(DaftarProdukRequest) returns (DaftarProdukResponse);
+  rpc UbahHarga(UbahHargaRequest) returns (Produk);
+  // Bayar memakai metadata "idempotency-key" agar aman diulang.
+  rpc Bayar(BayarRequest) returns (BayarResponse);
+  // Server streaming: server mengirim perubahan harga terus-menerus.
+  rpc PantauHarga(PantauHargaRequest) returns (stream Produk);
+  // Client streaming: klien mengirim banyak penjualan, server menjawab sekali.
+  rpc CatatPenjualan(stream Penjualan) returns (RingkasanPenjualan);
+  // Bidirectional streaming: tiap tawaran langsung dijawab.
+  rpc Tawar(stream Tawaran) returns (stream JawabanTawaran);
+}
+
+message Produk {
+  int64  id    = 1;
+  string nama  = 2;
+  int64  harga = 3;
+}
+
+message AmbilProdukRequest { int64 id = 1; }
+message DaftarProdukRequest {}
+message DaftarProdukResponse { repeated Produk produk = 1; }
+message UbahHargaRequest {
+  int64 id    = 1;
+  int64 harga = 2;
+}
+message BayarRequest {
+  string akun   = 1;
+  int64  jumlah = 2;
+}
+message BayarResponse {
+  int64  sisa       = 1;
+  string id_bayar   = 2;
+  bool   dari_cache = 3; // true bila hasil lama dikembalikan karena kunci sama
+}
+message PantauHargaRequest { repeated int64 id = 1; }
+message Penjualan {
+  int64 produk_id = 1;
+  int64 jumlah    = 2;
+}
+message RingkasanPenjualan {
+  int64 jumlah_pesan = 1;
+  int64 total_unit   = 2;
+  int64 total_rupiah = 3;
+}
+message Tawaran {
+  int64 produk_id = 1;
+  int64 harga     = 2;
+}
+message JawabanTawaran {
+  int64  produk_id = 1;
+  bool   diterima  = 2;
+  string pesan     = 3;
+}
