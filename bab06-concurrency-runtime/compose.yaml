@@ -1,0 +1,37 @@
+name: sister-bab06
+
+services:
+  lab:
+    build: ./services/lab
+    image: sister-bab06-lab:1.0
+    environment:
+      LAB_ADDR: ":8080"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50601:8080"
+    cpuset: "${LAB_CPUSET:-0-3}"
+    mem_limit: 2g
+    pids_limit: 8000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    image: sister-bab06-ui:1.0
+    environment:
+      LAB_URL: "http://lab:8080"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50600:3000"
+    depends_on:
+      lab:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
