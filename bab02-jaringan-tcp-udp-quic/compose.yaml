@@ -1,0 +1,145 @@
+# Bab 2: TCP, UDP, QUIC, socket API, tc netem, tcpdump, socket chat.
+#
+#   prober (lan-klien) ──> router (tc netem) ──> echo (lan-server)
+#   ui ──> prober API, chat API;  browser ──WebSocket──> chatgw ──TCP──> chat <──TCP── nc
+name: sister-bab02
+
+x-go: &go
+  image: sister-bab02-go:dev
+  restart: unless-stopped
+  init: true
+  pull_policy: never   # image dibangun oleh service echo (build: ./services)
+
+networks:
+  front: {}
+  lan-klien:
+    ipam:
+      config:
+        - subnet: ${KLIEN_NET:-10.202.2}.0/24
+  lan-server:
+    ipam:
+      config:
+        - subnet: ${SERVER_NET:-10.202.3}.0/24
+
+services:
+  echo:
+    <<: *go
+    build: ./services
+    command: ["/app/echo"]
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      LAB_IP: ${SERVER_NET:-10.202.3}.10
+      ROUTE: ${KLIEN_NET:-10.202.2}.0/24 via ${SERVER_NET:-10.202.3}.254
+    networks:
+      front: {}
+      lan-server:
+        ipv4_address: ${SERVER_NET:-10.202.3}.10
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50220:9000/tcp"   # echo TCP (nc)
+      - "${BIND_ADDR:-127.0.0.1}:50221:9001/udp"   # echo UDP (nc -u)
+      - "${BIND_ADDR:-127.0.0.1}:50222:9002/udp"   # QUIC
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  router:
+    <<: *go
+    command: ["/app/router"]
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      KLIEN_SIDE_IP: ${KLIEN_NET:-10.202.2}.254
+      SERVER_SIDE_IP: ${SERVER_NET:-10.202.3}.254
+    networks:
+      front: {}
+      lan-klien:
+        ipv4_address: ${KLIEN_NET:-10.202.2}.254
+      lan-server:
+        ipv4_address: ${SERVER_NET:-10.202.3}.254
+    depends_on:
+      echo: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8082/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  prober:
+    <<: *go
+    command: ["/app/prober"]
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      LAB_IP: ${KLIEN_NET:-10.202.2}.10
+      ECHO_LAB_IP: ${SERVER_NET:-10.202.3}.10
+      ROUTE: ${SERVER_NET:-10.202.3}.0/24 via ${KLIEN_NET:-10.202.2}.254
+      ECHO_CTL: http://echo:8081
+      ROUTER_CTL: http://router:8082
+    networks:
+      front: {}
+      lan-klien:
+        ipv4_address: ${KLIEN_NET:-10.202.2}.10
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50201:8080"
+    depends_on:
+      router: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  chat:
+    <<: *go
+    command: ["/app/chat"]
+    user: app
+    networks: [front]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50210:9100"   # socket TCP mentah: nc <host> 50210
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  chatgw:
+    <<: *go
+    command: ["/app/chatgw"]
+    user: app
+    environment:
+      CHAT_ADDR: chat:9100
+    networks: [front]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50202:8091"   # WebSocket untuk browser
+    depends_on:
+      chat: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8091/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  ui:
+    image: sister-bab02-ui:dev
+    build: ./ui
+    restart: unless-stopped
+    environment:
+      PROBER_URL: http://prober:8080
+      CHAT_API_URL: http://chat:8090
+      CHAT_WS_PORT: "50202"
+      CHAT_TCP_PORT: "50210"
+      ECHO_TCP_PORT: "50220"
+      ECHO_UDP_PORT: "50221"
+    networks: [front]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50200:3000"
+    depends_on:
+      prober: { condition: service_healthy }
+      chatgw: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/config"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
