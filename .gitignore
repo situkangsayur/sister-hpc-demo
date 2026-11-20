@@ -1,0 +1,14 @@
+.env
+node_modules/
+.next/
+out/
+dist/
+build/bin/
+*.log
+tmp/
+__pycache__/
+.DS_Store
+kubeconfig*.yaml
+*.pem
+*.key
+!**/testdata/*.pem
