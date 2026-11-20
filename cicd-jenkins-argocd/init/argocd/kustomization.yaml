@@ -1,0 +1,42 @@
+# Argo CD v3.4.13 (manifest resmi, diunduh init.sh dan dicek sha256-nya) dengan penyesuaian demo:
+# - dex, notifications, applicationset dimatikan (replicas 0) agar hemat RAM
+# - argocd-server tanpa TLS (server.insecure) dan dibuka lewat NodePort 30081
+# - repo Git dicek setiap 15 detik agar tag baru cepat terlihat tanpa webhook
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: argocd
+resources:
+  - install.yaml
+replicas:
+  - name: argocd-dex-server
+    count: 0
+  - name: argocd-notifications-controller
+    count: 0
+  - name: argocd-applicationset-controller
+    count: 0
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cmd-params-cm
+      data:
+        server.insecure: "true"
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-cm
+      data:
+        timeout.reconciliation: 15s
+        timeout.reconciliation.jitter: 0s
+        admin.enabled: "true"
+        users.anonymous.enabled: "false"
+  - target: { kind: Service, name: argocd-server }
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30081

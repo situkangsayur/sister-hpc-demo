@@ -1,0 +1,62 @@
+// Pipeline CI layanan app (demo CI/CD Jenkins + Argo CD).
+// Jenkins TIDAK men-deploy ke cluster. Tahap terakhir hanya menulis tag image baru ke repo
+// gitops; Argo CD di k3s yang menyamakan cluster dengan isi Git (GitOps, pull-based).
+pipeline {
+  agent any
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+    timeout(time: 15, unit: 'MINUTES')
+  }
+  environment {
+    BUILDKIT_HOST = 'tcp://buildkitd:1234'
+    IMAGE = 'registry:5000/demo/app'
+    GITOPS_REPO = 'gitea:3000/demo/gitops.git'
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_SHORT = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.TAG = "b${env.BUILD_NUMBER}-${env.GIT_SHORT}"
+          currentBuild.description = env.TAG
+        }
+        sh 'git log -1 --format="commit %h oleh %an: %s"'
+      }
+    }
+    stage('Unit test') {
+      steps {
+        // go vet + go test dijalankan di dalam BuildKit (target "test" pada Dockerfile).
+        sh 'buildctl build --progress plain --frontend dockerfile.v0 --local context=. --local dockerfile=. --opt target=test'
+      }
+    }
+    stage('Build & push image') {
+      steps {
+        sh '''
+          buildctl build --progress plain --frontend dockerfile.v0 \
+            --local context=. --local dockerfile=. \
+            --opt build-arg:VERSI=$TAG \
+            --output type=image,name=$IMAGE:$TAG,push=true,registry.insecure=true
+        '''
+      }
+    }
+    stage('Update gitops') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'gitea-bot', usernameVariable: 'GIT_USER', passwordVariable: 'GIT_PASS')]) {
+          sh '''
+            D=$(mktemp -d)
+            git clone -q --depth 1 "http://${GIT_USER}:${GIT_PASS}@${GITOPS_REPO}" "$D"
+            cd "$D"
+            sed -i "s/newTag: .*/newTag: ${TAG}/" app/kustomization.yaml
+            git diff --stat
+            git -c user.name=jenkins-bot -c user.email=jenkins-bot@demo.local commit -q -am "deploy app ${TAG}"
+            git push -q origin HEAD:main
+            cd / && rm -rf "$D"
+          '''
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,61 @@
+# Jenkins Configuration as Code: seluruh konfigurasi Jenkins (user, credential, job) dibaca dari
+# berkas ini saat start. Nilai ${...} diambil dari environment container (berasal dari .env).
+jenkins:
+  systemMessage: "Demo CI/CD Sistem Terdistribusi (STMIK Tazkia): Jenkins + BuildKit + Gitea + Argo CD"
+  numExecutors: 2
+  mode: NORMAL
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_USER}"
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  disabledAdministrativeMonitors:
+    - "hudson.util.DoubleLaunchChecker"
+    - "jenkins.diagnostics.ControllerExecutorsNoAgents"
+    - "jenkins.security.QueueItemAuthenticatorMonitor"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: gitea-bot
+              description: "User jenkins-bot di Gitea (hak tulis repo gitops)"
+              username: "${GITEA_BOT_USER}"
+              password: "${GITEA_BOT_PASSWORD}"
+
+unclassified:
+  location:
+    url: "${JENKINS_PUBLIC_URL}"
+
+jobs:
+  - script: |
+      pipelineJob('app') {
+        description('Pipeline CI layanan app: checkout, unit test, build & push image, update gitops.')
+        properties {
+          pipelineTriggers {
+            triggers {
+              // Jadwal kosong: tidak polling berkala. Polling hanya dipicu webhook Gitea
+              // ke /git/notifyCommit setiap ada push.
+              pollSCM { scmpoll_spec('') }
+            }
+          }
+        }
+        definition {
+          cpsScm {
+            lightweight(true)
+            scriptPath('Jenkinsfile')
+            scm {
+              git {
+                remote { url('http://gitea:3000/demo/app.git') }
+                branch('*/main')
+              }
+            }
+          }
+        }
+      }

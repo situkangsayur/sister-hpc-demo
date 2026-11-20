@@ -1,0 +1,212 @@
+# Demo CI/CD lintas bab: Jenkins (CI) + Argo CD (CD, GitOps) di k3s.
+# Alur: commit ke Gitea/app -> webhook -> Jenkins (test, build image dengan BuildKit, push ke
+# registry lokal, commit tag ke Gitea/gitops) -> Argo CD di k3s melihat commit baru -> sync.
+# Semua port host diikat ke ${BIND_ADDR}. Rentang port 51000-51099, UI di 51000.
+name: sister-cicd
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "2" }
+
+x-gitea: &gitea-image
+  image: gitea/gitea:28.3.0-rootless
+  volumes:
+    - gitea-data:/var/lib/gitea
+    - gitea-config:/etc/gitea
+
+services:
+  # ------------------------------------------------------------------ Git server
+  gitea:
+    <<: [*gitea-image, *logging]
+    restart: unless-stopped
+    environment:
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__security__PASSWORD_COMPLEXITY: "off"
+      GITEA__security__MIN_PASSWORD_LENGTH: "8"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__ROOT_URL: http://${BIND_ADDR:-127.0.0.1}:51001/
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__repository__DEFAULT_BRANCH: main
+      GITEA__security__ALLOWED_HOST_LIST: private
+      GITEA__log__LEVEL: Info
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/api/healthz"]
+      interval: 3s
+      retries: 60
+    ports: ["${BIND_ADDR:-127.0.0.1}:51001:3000"]
+
+  # Gitea tidak punya env untuk admin pertama; user dibuat lewat CLI pada volume yang sama.
+  gitea-admin:
+    <<: [*gitea-image, *logging]
+    restart: "no"
+    depends_on:
+      gitea: { condition: service_healthy }
+    environment:
+      U: ${GITEA_ADMIN_USER:?isi .env}
+      P: ${GITEA_ADMIN_PASSWORD:?isi .env}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        if gitea admin user list --admin | awk '{print $$2}' | grep -qx "$$U"; then
+          gitea admin user change-password --username "$$U" --password "$$P" --must-change-password=false
+        else
+          gitea admin user create --admin --username "$$U" --password "$$P" --email "$$U@demo.local" --must-change-password=false
+        fi
+
+  # ------------------------------------------------------------------ CI
+  registry:
+    image: registry:3.1.1
+    restart: unless-stopped
+    volumes: ["registry-data:/var/lib/registry"]
+    environment:
+      OTEL_TRACES_EXPORTER: none
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/v2/"]
+      interval: 3s
+      retries: 30
+    ports: ["${BIND_ADDR:-127.0.0.1}:51002:5000"]
+    <<: *logging
+
+  # BuildKit rootless: membangun image tanpa Docker socket host. Butuh seccomp/apparmor
+  # unconfined (untuk user namespace), tetapi tidak privileged.
+  buildkitd:
+    image: moby/buildkit:v0.34.2-rootless
+    restart: unless-stopped
+    command: ["--addr", "tcp://0.0.0.0:1234", "--oci-worker-no-process-sandbox"]
+    security_opt: ["seccomp=unconfined", "apparmor=unconfined"]
+    volumes:
+      - ./buildkit/buildkitd.toml:/home/user/.config/buildkit/buildkitd.toml:ro
+      - buildkit-cache:/home/user/.local/share/buildkit
+    healthcheck:
+      test: ["CMD", "buildctl", "--addr", "tcp://127.0.0.1:1234", "debug", "workers"]
+      interval: 3s
+      retries: 30
+    <<: *logging
+
+  jenkins:
+    build: ./jenkins
+    image: sister-cicd-jenkins:2.580.2
+    restart: unless-stopped
+    depends_on:
+      gitea: { condition: service_healthy }
+      buildkitd: { condition: service_healthy }
+    environment:
+      JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER:?isi .env}
+      JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD:?isi .env}
+      GITEA_BOT_USER: ${GITEA_BOT_USER:?isi .env}
+      GITEA_BOT_PASSWORD: ${GITEA_BOT_PASSWORD:?isi .env}
+      JENKINS_PUBLIC_URL: http://${BIND_ADDR:-127.0.0.1}:51003/
+    volumes: ["jenkins-home:/var/jenkins_home"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:8080/login"]
+      interval: 5s
+      retries: 60
+      start_period: 20s
+    ports: ["${BIND_ADDR:-127.0.0.1}:51003:8080"]
+    <<: *logging
+
+  # ------------------------------------------------------------------ CD: k3s + Argo CD
+  k3s:
+    image: rancher/k3s:v1.32.3-k3s1
+    restart: unless-stopped
+    privileged: true
+    tmpfs: [/run, /var/run]
+    ulimits:
+      nproc: 65535
+      nofile: { soft: 65535, hard: 65535 }
+    environment:
+      K3S_TOKEN: ${K3S_TOKEN:?isi .env}
+    # traefik/servicelb/metrics-server/local-storage dimatikan agar ringan; coredns tetap
+    # dibutuhkan Argo CD. Ambang eviction dan image GC diturunkan karena disk lab hampir penuh.
+    command:
+      - server
+      - --node-name=cicd-node
+      - --tls-san=k3s
+      - --disable=traefik,servicelb,metrics-server,local-storage
+      - --disable-helm-controller
+      - --disable-network-policy
+      # Modul br_netfilter tidak dimuat di host lab (dan container tidak boleh memuatnya), sehingga
+      # pod -> ClusterIP -> pod di bridge yang sama gagal. masquerade-all membuat semua lalu lintas
+      # Service di-SNAT ke node sehingga balasan melewati iptables (DNS dan Service jalan).
+      - --kube-proxy-arg=masquerade-all=true
+      - --write-kubeconfig=/output/kubeconfig.yaml
+      - --write-kubeconfig-mode=644
+      - --kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%
+      - --kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%
+      - --kubelet-arg=image-gc-high-threshold=100
+      - --kubelet-arg=image-gc-low-threshold=99
+    volumes:
+      - k3s-data:/var/lib/rancher/k3s
+      - k3s-kube:/output
+      - ./k3s/registries.yaml:/etc/rancher/k3s/registries.yaml:ro
+    healthcheck:
+      test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+      interval: 3s
+      retries: 100
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:51004:6443"   # Kubernetes API
+      - "${BIND_ADDR:-127.0.0.1}:51005:30080"  # NodePort aplikasi yang di-deploy
+      - "${BIND_ADDR:-127.0.0.1}:51006:30081"  # NodePort UI/API Argo CD
+    <<: *logging
+
+  # ------------------------------------------------------------------ init sekali jalan
+  init:
+    build: { context: ., dockerfile: init/Dockerfile }
+    image: sister-cicd-init:1.0
+    restart: "no"
+    depends_on:
+      gitea-admin: { condition: service_completed_successfully }
+      jenkins: { condition: service_healthy }
+      registry: { condition: service_healthy }
+      k3s: { condition: service_healthy }
+    environment: &kred
+      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER}
+      GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD}
+      GITEA_BOT_USER: ${GITEA_BOT_USER}
+      GITEA_BOT_PASSWORD: ${GITEA_BOT_PASSWORD}
+      JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER}
+      JENKINS_ADMIN_PASSWORD: ${JENKINS_ADMIN_PASSWORD}
+      ARGOCD_ADMIN_PASSWORD: ${ARGOCD_ADMIN_PASSWORD:?isi .env}
+    volumes: ["k3s-kube:/kube:ro"]
+    <<: *logging
+
+  # ------------------------------------------------------------------ viewer
+  pantau:
+    build: ./services/pantau
+    image: sister-cicd-pantau:1.0
+    restart: unless-stopped
+    environment:
+      <<: *kred
+      PUBLIC_HOST: ${BIND_ADDR:-127.0.0.1}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      retries: 20
+    ports: ["${BIND_ADDR:-127.0.0.1}:51007:8080"]
+    <<: *logging
+
+  ui:
+    build: ./ui
+    image: sister-cicd-ui:1.0
+    restart: unless-stopped
+    depends_on:
+      pantau: { condition: service_healthy }
+    environment:
+      PANTAU_URL: http://pantau:8080
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 3s
+      retries: 30
+    ports: ["${BIND_ADDR:-127.0.0.1}:51000:3000"]
+    <<: *logging
+
+volumes:
+  gitea-data:
+  gitea-config:
+  registry-data:
+  buildkit-cache:
+  jenkins-home:
+  k3s-data:
+  k3s-kube:

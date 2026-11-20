@@ -1,0 +1,8 @@
+# BuildKit rootless untuk Jenkins. Registry lokal hanya HTTP (demo), jadi ditandai insecure.
+[worker.oci]
+  gc = true
+  gckeepstorage = 2000000000   # batasi cache build sekitar 2 GB (disk lab terbatas)
+
+[registry."registry:5000"]
+  http = true
+  insecure = true

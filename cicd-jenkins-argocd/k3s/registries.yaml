@@ -1,0 +1,5 @@
+# containerd di k3s menarik image registry:5000/... lewat HTTP biasa dari service registry.
+mirrors:
+  "registry:5000":
+    endpoint:
+      - "http://registry:5000"
