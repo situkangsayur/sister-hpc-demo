@@ -1,0 +1,239 @@
+# Bab 7: Replikasi, Konsistensi, Kubernetes (slide P07).
+# Setiap demo adalah satu profile agar bagian berat dapat dijalankan terpisah:
+#   docker compose --profile clock up -d --build
+#   docker compose --profile replication up -d --build
+#   docker compose --profile consensus up -d --build
+#   docker compose --profile search up -d --build
+#   docker compose --profile k8s up -d --build
+# UI (port 50700) ikut menyala bersama profile mana pun.
+name: sister-bab07
+
+x-go: &go
+  image: sister-bab07-go:dev
+  build: ./services
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "2" }
+
+services:
+  ui:
+    build: ./ui
+    image: sister-bab07-ui:dev
+    profiles: [clock, replication, consensus, search, k8s]
+    restart: unless-stopped
+    ports: ["${BIND_ADDR:-127.0.0.1}:50700:3000"]
+    <<: *logging
+
+  # ---------------------------------------------------------------- clock
+  clock-p1: &clock
+    <<: [*go, *logging]
+    profiles: [clock]
+    command: ["clocknode"]
+    environment: &clockenv
+      NODE_ID: P1
+      CLOCK_SKEW_MS: "0"
+      PEERS: P1=http://clock-p1:8080,P2=http://clock-p2:8080,P3=http://clock-p3:8080
+    ports: ["${BIND_ADDR:-127.0.0.1}:50710:8080"]
+  clock-p2:
+    <<: *clock
+    environment:
+      <<: *clockenv
+      NODE_ID: P2
+      CLOCK_SKEW_MS: "-1500" # jam dinding P2 mundur 1,5 detik
+    ports: ["${BIND_ADDR:-127.0.0.1}:50711:8080"]
+  clock-p3:
+    <<: *clock
+    environment:
+      <<: *clockenv
+      NODE_ID: P3
+      CLOCK_SKEW_MS: "700" # jam dinding P3 maju 0,7 detik
+    ports: ["${BIND_ADDR:-127.0.0.1}:50712:8080"]
+
+  # ---------------------------------------------------------- replication
+  pg-primary:
+    image: postgres:16-alpine
+    profiles: [replication]
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-changeme}
+      POSTGRES_DB: katalog
+      REPL_PASSWORD: ${REPL_PASSWORD:-changeme-repl}
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=5", "-c", "max_replication_slots=5",
+              "-c", "wal_keep_size=64MB", "-c", "track_commit_timestamp=on"]
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      - ./postgres/primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d katalog"]
+      interval: 2s
+      retries: 30
+    ports: ["${BIND_ADDR:-127.0.0.1}:50720:5432"]
+    <<: *logging
+  pg-replica:
+    image: postgres:16-alpine
+    profiles: [replication]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/scripts/replica-entrypoint.sh"]
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      REPL_PASSWORD: ${REPL_PASSWORD:-changeme-repl}
+      REPLICA_APPLY_DELAY_MS: ${REPLICA_APPLY_DELAY_MS:-2000}
+    volumes:
+      - pg-replica:/var/lib/postgresql/data
+      - ./postgres/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+    depends_on:
+      pg-primary: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 60
+    ports: ["${BIND_ADDR:-127.0.0.1}:50721:5432"]
+    <<: *logging
+  repl-api:
+    <<: [*go, *logging]
+    profiles: [replication]
+    command: ["replapi"]
+    environment:
+      PRIMARY_URL: postgres://postgres:${PG_PASSWORD:-changeme}@pg-primary:5432/katalog
+      REPLICA_URL: postgres://postgres:${PG_PASSWORD:-changeme}@pg-replica:5432/katalog
+    depends_on:
+      pg-primary: { condition: service_healthy }
+      pg-replica: { condition: service_healthy }
+    ports: ["${BIND_ADDR:-127.0.0.1}:50722:8080"]
+
+  # ------------------------------------------------------------ consensus
+  raft-n1: &raft
+    <<: [*go, *logging]
+    profiles: [consensus]
+    command: ["raftnode"]
+    environment: &raftenv
+      NODE_ID: n1
+      PEERS: n1=raft-n1:7000=http://raft-n1:8080,n2=raft-n2:7000=http://raft-n2:8080,n3=raft-n3:7000=http://raft-n3:8080
+    volumes: ["raft-n1:/data"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50730:8080"]
+  raft-n2:
+    <<: *raft
+    environment: { <<: *raftenv, NODE_ID: n2 }
+    volumes: ["raft-n2:/data"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50731:8080"]
+  raft-n3:
+    <<: *raft
+    environment: { <<: *raftenv, NODE_ID: n3 }
+    volumes: ["raft-n3:/data"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50732:8080"]
+
+  # --------------------------------------------------------------- search
+  # Security plugin dimatikan HANYA untuk demo lokal (port terikat ke BIND_ADDR).
+  os-node1: &os
+    image: opensearchproject/opensearch:2.19.1
+    profiles: [search]
+    restart: unless-stopped
+    environment: &osenv
+      cluster.name: sister-bab07
+      node.name: os-node1
+      node.roles: cluster_manager,data,ingest
+      discovery.seed_hosts: os-node1,os-node2
+      cluster.initial_cluster_manager_nodes: os-node1
+      bootstrap.memory_lock: "false"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    mem_limit: 1400m
+    volumes: ["os-node1:/usr/share/opensearch/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 5s
+      retries: 40
+    ports: ["${BIND_ADDR:-127.0.0.1}:50740:9200"]
+    <<: *logging
+  os-node2:
+    <<: *os
+    environment:
+      <<: *osenv
+      node.name: os-node2
+      node.roles: data,ingest
+    volumes: ["os-node2:/usr/share/opensearch/data"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50741:9200"]
+  search-api:
+    <<: [*go, *logging]
+    profiles: [search]
+    command: ["searchapi"]
+    environment:
+      OS_URLS: http://os-node1:9200,http://os-node2:9200
+      OS_NODES: os-node1,os-node2
+    ports: ["${BIND_ADDR:-127.0.0.1}:50742:8080"]
+
+  # ------------------------------------------------------------------ k8s
+  # k8s-loader menyalin image katalog (tar) ke folder auto-import k3s, lalu selesai.
+  k8s-loader:
+    <<: [*go, *logging]
+    profiles: [k8s]
+    restart: "no"
+    command: ["sh", "-c", "cp /images/katalog-image.tar /k3s-images/ && ls -l /k3s-images"]
+    volumes: ["k3s-images:/k3s-images"]
+  k3s:
+    image: rancher/k3s:v1.32.3-k3s1
+    profiles: [k8s]
+    restart: unless-stopped
+    privileged: true
+    tmpfs: [/run, /var/run]
+    ulimits:
+      nproc: 65535
+      nofile: { soft: 65535, hard: 65535 }
+    environment:
+      K3S_TOKEN: ${K3S_TOKEN:-changeme-k3s}
+    # Komponen yang tidak dipakai dimatikan agar ringan. Ambang eviction dan image GC
+    # diturunkan karena disk host lab hampir penuh; tanpa ini kubelet menandai DiskPressure.
+    command:
+      - server
+      - --node-name=k3s-node
+      - --tls-san=k3s
+      - --disable=traefik,servicelb,metrics-server,local-storage,coredns
+      - --disable-network-policy
+      - --write-kubeconfig=/output/kubeconfig.yaml
+      - --write-kubeconfig-mode=644
+      - --kubelet-arg=eviction-hard=imagefs.available<1%,nodefs.available<1%
+      - --kubelet-arg=eviction-minimum-reclaim=imagefs.available=1%,nodefs.available=1%
+      - --kubelet-arg=image-gc-high-threshold=100
+      - --kubelet-arg=image-gc-low-threshold=99
+    volumes:
+      - k3s-data:/var/lib/rancher/k3s
+      - k3s-images:/var/lib/rancher/k3s/agent/images
+      - k3s-kube:/output
+    depends_on:
+      k8s-loader: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "kubectl", "get", "--raw", "/readyz"]
+      interval: 3s
+      retries: 60
+    ports: ["${BIND_ADDR:-127.0.0.1}:50750:6443"]
+    <<: *logging
+  k8s-watch:
+    <<: [*go, *logging]
+    profiles: [k8s]
+    command: ["k8swatch"]
+    environment:
+      KUBECONFIG: /kube/kubeconfig.yaml
+      K3S_SERVER: https://k3s:6443
+      TARGET_URL: http://k3s:30080
+    volumes: ["k3s-kube:/kube:ro"]
+    depends_on: [k3s]
+    ports: ["${BIND_ADDR:-127.0.0.1}:50751:8080"]
+
+volumes:
+  pg-primary:
+  pg-replica:
+  raft-n1:
+  raft-n2:
+  raft-n3:
+  os-node1:
+  os-node2:
+  k3s-data:
+  k3s-images:
+  k3s-kube:
