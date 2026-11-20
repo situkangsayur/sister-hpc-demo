@@ -1,0 +1,90 @@
+# Bab 1 (slide P01): Cluster Visualizer.
+# Tiga node Go identik di belakang nginx, data bersama di PostgreSQL, monitor heartbeat + SSE,
+# dan UI Next.js. Semua port host diikat ke ${BIND_ADDR}.
+name: sister-bab01
+
+x-node: &node
+  build: ./services/node
+  image: sister-bab01-node:1.0
+  depends_on:
+    db: { condition: service_healthy }
+  restart: unless-stopped   # mode "crash" keluar dengan kode 1; Docker menyalakannya lagi (MTTR)
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/admin/fault"]
+    interval: 3s
+    timeout: 2s
+    retries: 20
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cluster
+      POSTGRES_USER: cluster
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?isi DB_PASSWORD di .env}
+    volumes: ["dbdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cluster -d cluster"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  node1:
+    <<: *node
+    environment: &nodeenv
+      NODE_NAME: node1
+      DATABASE_URL: postgres://cluster:${DB_PASSWORD}@db:5432/cluster?sslmode=disable
+    ports: ["${BIND_ADDR:-127.0.0.1}:50111:8080"]
+    networks: { default: { ipv4_address: 172.29.101.11 } }
+  node2:
+    <<: *node
+    environment:
+      <<: *nodeenv
+      NODE_NAME: node2
+    ports: ["${BIND_ADDR:-127.0.0.1}:50112:8080"]
+    networks: { default: { ipv4_address: 172.29.101.12 } }
+  node3:
+    <<: *node
+    environment:
+      <<: *nodeenv
+      NODE_NAME: node3
+    ports: ["${BIND_ADDR:-127.0.0.1}:50113:8080"]
+    networks: { default: { ipv4_address: 172.29.101.13 } }
+
+  nginx:
+    image: nginx:1.28-alpine
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports: ["${BIND_ADDR:-127.0.0.1}:50101:8080"]
+    depends_on: [node1, node2, node3]
+    restart: unless-stopped
+
+  monitor:
+    build: ./services/monitor
+    image: sister-bab01-monitor:1.0
+    environment:
+      NODES: node1=http://node1:8080|http://node1:9090,node2=http://node2:8080|http://node2:9090,node3=http://node3:8080|http://node3:9090
+      LB_URL: http://nginx:8080
+    ports: ["${BIND_ADDR:-127.0.0.1}:50102:8080"]
+    depends_on: [nginx]
+    restart: unless-stopped
+
+  ui:
+    build: ./ui
+    image: sister-bab01-ui:1.0
+    environment:
+      MONITOR_URL: http://monitor:8080
+    ports: ["${BIND_ADDR:-127.0.0.1}:50100:3000"]
+    depends_on: [monitor]
+    restart: unless-stopped
+
+# IP node tetap, karena nginx membaca nama node hanya sekali saat mulai.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.101.0/24
+
+volumes:
+  dbdata:

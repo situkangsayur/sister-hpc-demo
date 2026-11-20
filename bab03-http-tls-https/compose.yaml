@@ -1,0 +1,119 @@
+# Bab 3 (HTTP, TLS, HTTPS; slide P03). Jalankan: cp .env.example .env && docker compose up -d --build
+name: sister-bab03
+
+x-go: &go
+  image: sister-bab03-go:dev   # dibangun oleh service certgen
+  pull_policy: never
+  restart: unless-stopped
+  volumes:
+    - certs:/certs:ro
+
+services:
+  # Membuat CA demo + certificate saat runtime ke volume "certs", lalu selesai.
+  certgen:
+    image: sister-bab03-go:dev
+    build: ./services
+    command: ["certgen"]
+    environment:
+      CERT_DIR: /certs
+      CERT_SANS: origin-a,origin-b,nginx,${EXTRA_SANS:-localhost,127.0.0.1}
+    volumes:
+      - certs:/certs
+    restart: "no"
+
+  origin-a:
+    <<: *go
+    command: ["origin"]
+    environment:
+      INSTANCE: origin-a
+    depends_on:
+      certgen: { condition: service_completed_successfully }
+    networks: [uji]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50304:8443/tcp"   # HTTPS h1/h2
+      - "${BIND_ADDR:-127.0.0.1}:50304:8443/udp"   # HTTP/3 (QUIC)
+      - "${BIND_ADDR:-127.0.0.1}:50305:9443/tcp"   # mTLS
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  origin-b:
+    <<: *go
+    command: ["origin"]
+    environment:
+      INSTANCE: origin-b
+    depends_on:
+      certgen: { condition: service_completed_successfully }
+    networks: [uji]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  nginx:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - certs:/certs:ro
+    depends_on:
+      origin-a: { condition: service_healthy }
+      origin-b: { condition: service_healthy }
+    networks: [uji]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50302:80"
+      - "${BIND_ADDR:-127.0.0.1}:50303:443"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ -S 2>&1 | grep -q 301 || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  # Semua pengukuran dijalankan dari sini. NET_ADMIN dibutuhkan untuk tc netem.
+  probe:
+    <<: *go
+    command: ["probe"]
+    cap_add: [NET_ADMIN]
+    environment:
+      ORIGIN_HOST: origin-a
+      NGINX_HOST: nginx
+      ORIGINS: http://origin-a:8080,http://origin-b:8080
+      NETEM_DELAY_MS: ${NETEM_DELAY_MS:-25}
+      NETEM_LOSS_PCT: ${NETEM_LOSS_PCT:-0}
+    depends_on:
+      nginx: { condition: service_healthy }
+    networks: [uji, default]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50301:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  ui:
+    image: sister-bab03-ui:dev
+    build: ./ui
+    restart: unless-stopped
+    environment:
+      PROBE_URL: http://probe:8090
+    depends_on:
+      probe: { condition: service_healthy }
+    networks: [default]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:50300:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  certs:
+
+networks:
+  uji:
+  default:
