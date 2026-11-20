@@ -1,0 +1,7 @@
+name: demo-target gRPC health
+kind: grpc
+target: 127.0.0.1:50099
+grpcMethod: grpc.health.v1.Health/Check
+request: '{"service": ""}'
+concurrency: 5
+requests: 500

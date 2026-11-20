@@ -1,0 +1,67 @@
+# Loki single binary untuk demo kelas: penyimpanan filesystem, retensi pendek.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: "2024-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Retensi 72 jam: log lebih lama dihapus compactor.
+  retention_period: 72h
+  allow_structured_metadata: true
+  # Batas ingest kecil supaya disk server lab tidak terkuras oleh demo yang "berisik".
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  per_stream_rate_limit: 2MB
+  per_stream_rate_limit_burst: 4MB
+  max_global_streams_per_user: 2000
+  max_line_size: 64KB
+  max_line_size_truncate: true
+  reject_old_samples: true
+  reject_old_samples_max_age: 72h
+  max_query_lookback: 72h
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 1h
+  delete_request_store: filesystem
+
+ingester:
+  chunk_idle_period: 15m
+  max_chunk_age: 1h
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 64
+
+analytics:
+  reporting_enabled: false

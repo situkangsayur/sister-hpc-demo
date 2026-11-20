@@ -1,0 +1,12 @@
+# Contoh skenario untuk demo Bab 4 (jalankan dulu bab04-rpc-rest-grpc-graphql).
+# ${BIND_ADDR} diganti dari --host, env BIND_ADDR, atau 127.0.0.1.
+name: Bab 4 REST daftar produk
+kind: http
+method: GET
+url: http://${BIND_ADDR}:50401/v1/produk
+headers:
+  X-Request-Id: perftest-bab04
+concurrency: 20
+duration: 30s
+rps: 0
+timeout: 5s

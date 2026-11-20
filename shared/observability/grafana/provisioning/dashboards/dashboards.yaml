@@ -1,0 +1,25 @@
+apiVersion: 1
+providers:
+  # Semua file JSON di grafana/dashboards/ dipasang ke folder "Sister Demo".
+  # Bab boleh menambah file dashboard-nya sendiri (mis. bab04-....json) di folder itu.
+  - name: sister-demo
+    orgId: 1
+    folder: Sister Demo
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+  # Dashboard per bab yang disimpan di folder bab itu sendiri (lihat volume di compose.yaml).
+  - name: sister-bab
+    orgId: 1
+    folder: Sister Demo
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards-bab
+      foldersFromFilesStructure: false

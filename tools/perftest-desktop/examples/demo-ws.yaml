@@ -1,0 +1,6 @@
+name: demo-target WebSocket echo
+kind: ws
+url: ws://127.0.0.1:50098/ws
+message: halo
+concurrency: 5
+requests: 500

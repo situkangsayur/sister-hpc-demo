@@ -1,0 +1,7 @@
+name: demo-target GraphQL
+kind: graphql
+url: http://127.0.0.1:50098/graphql
+query: "query { halo }"
+variables: '{}'
+concurrency: 5
+requests: 500

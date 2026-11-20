@@ -1,0 +1,128 @@
+# Preset endpoint tiap bab untuk perftest. ${BIND_ADDR} diganti dari pengaturan "Host" di
+# aplikasi (atau variabel lingkungan BIND_ADDR; default 127.0.0.1).
+# Port mengikuti docs/KONVENSI.md (Bab NN -> 50000+NN*100 .. +99). Endpoint di bawah diambil
+# dari compose.yaml dan kode tiap bab per 21 Nov 2026; bila demo bab berubah, sesuaikan di sini
+# atau muat file preset sendiri (menu "Muat preset YAML").
+presets:
+  # ---------- Bab 1: sistem terdistribusi 101 (nginx di depan 3 node) ----------
+  - bab: 1
+    name: "Bab 1 · nginx load balancer → 3 node (GET /ping)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50101/ping", concurrency: 20, duration: 20s }
+  - bab: 1
+    name: "Bab 1 · satu node langsung (node1 GET /ping)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50111/ping", concurrency: 20, duration: 20s }
+  - bab: 1
+    name: "Bab 1 · UI demo (GET /)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50100/", concurrency: 5, duration: 10s }
+
+  # ---------- Bab 2: jaringan TCP/UDP/QUIC ----------
+  - bab: 2
+    name: "Bab 2 · chat WebSocket gateway (ws /ws)"
+    config: { kind: ws, url: "ws://${BIND_ADDR}:50202/ws", message: "halo dari perftest", noReply: true, concurrency: 10, duration: 15s, rps: 50 }
+  - bab: 2
+    name: "Bab 2 · prober API (GET /api/status)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50201/api/status", concurrency: 5, duration: 10s }
+
+  # ---------- Bab 3: HTTP, TLS, HTTPS ----------
+  - bab: 3
+    name: "Bab 3 · nginx HTTP (GET /)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50302/", concurrency: 20, duration: 15s }
+  - bab: 3
+    name: "Bab 3 · nginx HTTPS self-signed (GET /)"
+    config: { kind: http, method: GET, url: "https://${BIND_ADDR}:50303/", insecureSkipVerify: true, concurrency: 20, duration: 15s }
+  - bab: 3
+    name: "Bab 3 · origin HTTPS h1/h2 (GET /healthz)"
+    config: { kind: http, method: GET, url: "https://${BIND_ADDR}:50304/healthz", insecureSkipVerify: true, concurrency: 20, duration: 15s }
+
+  # ---------- Bab 4: RPC, REST, gRPC, GraphQL (semua lewat APISIX 50401) ----------
+  - bab: 4
+    name: "Bab 4 · REST daftar produk (GET /v1/produk)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50401/v1/produk", concurrency: 20, duration: 20s }
+  - bab: 4
+    name: "Bab 4 · REST satu produk (GET /v1/produk/1)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50401/v1/produk/1", concurrency: 20, duration: 20s }
+  - bab: 4
+    name: "Bab 4 · GraphQL daftarProduk + penjual (N+1, tanpa DataLoader)"
+    config:
+      kind: graphql
+      url: "http://${BIND_ADDR}:50401/graphql"
+      query: "{ daftarProduk { id nama harga penjual { nama kota } } }"
+      concurrency: 10
+      duration: 20s
+  - bab: 4
+    name: "Bab 4 · GraphQL daftarProduk + penjual (DataLoader on)"
+    config:
+      kind: graphql
+      url: "http://${BIND_ADDR}:50401/graphql"
+      headers: { X-DataLoader: "on" }
+      query: "{ daftarProduk { id nama harga penjual { nama kota } } }"
+      concurrency: 10
+      duration: 20s
+  - bab: 4
+    name: "Bab 4 · GraphQL produk(id) dengan variables"
+    config:
+      kind: graphql
+      url: "http://${BIND_ADDR}:50401/graphql"
+      query: "query($id: Int!) { produk(id: $id) { id nama harga } }"
+      variables: '{"id": 1}'
+      concurrency: 10
+      duration: 20s
+  - bab: 4
+    name: "Bab 4 · gRPC AmbilProduk (reflection lewat APISIX)"
+    config:
+      kind: grpc
+      target: "${BIND_ADDR}:50401"
+      grpcMethod: "katalog.v1.KatalogService/AmbilProduk"
+      request: '{"id": 1}'
+      concurrency: 20
+      duration: 20s
+  - bab: 4
+    name: "Bab 4 · gRPC DaftarProduk"
+    config:
+      kind: grpc
+      target: "${BIND_ADDR}:50401"
+      grpcMethod: "katalog.v1.KatalogService/DaftarProduk"
+      request: "{}"
+      concurrency: 20
+      duration: 20s
+  - bab: 4
+    name: "Bab 4 · SOAP/XML (GET /soap)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50401/soap", concurrency: 10, duration: 15s }
+  - bab: 4
+    name: "Bab 4 · chat WebSocket (ws /v1/chat)"
+    config: { kind: ws, url: "ws://${BIND_ADDR}:50401/v1/chat", message: '{"teks":"halo dari perftest"}', noReply: true, concurrency: 10, duration: 15s, rps: 50 }
+
+  # ---------- Bab 5: microservices dan messaging (APISIX 50501, nginx order-lb 50502) ----------
+  - bab: 5
+    name: "Bab 5 · gateway ping (GET /gw/ping)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50501/gw/ping", concurrency: 20, duration: 15s }
+  - bab: 5
+    name: "Bab 5 · katalog lewat gateway (GET /api/catalog/products)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50501/api/catalog/products", concurrency: 20, duration: 20s }
+  - bab: 5
+    name: "Bab 5 · daftar order lewat gateway (GET /api/orders)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50501/api/orders", concurrency: 10, duration: 20s }
+
+  # ---------- Bab 6: concurrency dan runtime ----------
+  - bab: 6
+    name: "Bab 6 · lab health (GET /api/health)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50601/api/health", concurrency: 50, duration: 15s }
+  - bab: 6
+    name: "Bab 6 · metrics runtime (GET /api/metrics)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50601/api/metrics", concurrency: 20, duration: 15s }
+
+  # ---------- Bab 7: replikasi, konsistensi, Kubernetes ----------
+  - bab: 7
+    name: "Bab 7 · replication API (GET /status)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50722/status", concurrency: 10, duration: 15s }
+  - bab: 7
+    name: "Bab 7 · search API OpenSearch 2 node (GET /search?q=buku)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50742/search?q=buku", concurrency: 10, duration: 15s }
+  - bab: 7
+    name: "Bab 7 · UI demo (GET /)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50700/", concurrency: 5, duration: 10s }
+
+  # ---------- umum ----------
+  - bab: 0
+    name: "Observability · Grafana health (GET :50000/api/health)"
+    config: { kind: http, method: GET, url: "http://${BIND_ADDR}:50000/api/health", concurrency: 5, duration: 10s }

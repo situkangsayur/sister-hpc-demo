@@ -1,0 +1,84 @@
+// Grafana Alloy: baca log container lewat Docker socket (read-only), beri label,
+// parse log JSON (level, service, request_id), lalu kirim ke Loki.
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  // Hanya project yang cocok LOG_PROJECT_REGEX (default sister-.*). Container lain
+  // di mesin yang sama tidak ikut dibaca.
+  rule {
+    source_labels = ["compose_project"]
+    regex         = sys.env("LOG_PROJECT_REGEX")
+    action        = "keep"
+  }
+}
+
+loki.source.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.containers.output
+  refresh_interval = "5s"
+  forward_to       = [loki.process.json.receiver]
+}
+
+loki.process "json" {
+  // Baris non-JSON tetap diteruskan apa adanya; stage json hanya mengisi field bila valid.
+  stage.json {
+    expressions = {
+      level      = "level",
+      service    = "service",
+      request_id = "request_id",
+    }
+  }
+
+  // Fallback untuk log logfmt (mis. Grafana, Loki): ambil "level=info".
+  stage.regex {
+    expression = "(?:^|\\s)level=(?P<level_lf>[A-Za-z]+)"
+  }
+
+  // slog menulis "INFO"/"ERROR"; seragamkan ke huruf kecil.
+  stage.template {
+    source   = "level"
+    template = "{{ if .Value }}{{ ToLower .Value }}{{ else if .level_lf }}{{ ToLower .level_lf }}{{ end }}"
+  }
+
+  // level dan service menjadi label (kardinalitas rendah).
+  stage.labels {
+    values = {
+      level   = "",
+      service = "",
+    }
+  }
+
+  // request_id kardinalitasnya tinggi: simpan sebagai structured metadata, bukan label.
+  stage.structured_metadata {
+    values = {
+      request_id = "",
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

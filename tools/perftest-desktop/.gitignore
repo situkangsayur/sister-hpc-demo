@@ -1,0 +1,9 @@
+# Hasil build frontend dibuat ulang oleh "npm run build"; hanya penanda folder yang di-commit
+# (go:embed butuh folder frontend/out ada). Root .gitignore mengabaikan out/, jadi folder
+# di-include ulang dulu di sini.
+!frontend/out/
+frontend/out/*
+!frontend/out/.gitkeep
+frontend/wailsjs/
+frontend/package.json.md5
+build/bin/
