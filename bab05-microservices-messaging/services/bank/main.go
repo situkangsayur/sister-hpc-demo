@@ -433,6 +433,9 @@ func (s *svc) bayarBelanja(w http.ResponseWriter, r *http.Request) {
 		NoRekening string `json:"no_rekening"`
 		OrderID    string `json:"order_id"`
 		Nominal    int64  `json:"nominal"`
+		// OccurredAt (opsional) = waktu checkout dari event saga. Panggilan internal tidak boleh
+		// menggagalkan saga karena jam: nilai tidak valid atau masa depan -> sekarang.
+		OccurredAt string `json:"occurred_at"`
 	}
 	if err := platform.ReadJSON(r, &in); err != nil || in.OrderID == "" || in.NoRekening == "" {
 		s.fail(w, r, bad(400, "butuh no_rekening, order_id, nominal"))
@@ -445,13 +448,17 @@ func (s *svc) bayarBelanja(w http.ResponseWriter, r *http.Request) {
 		platform.WriteJSON(w, 200, map[string]any{"transaksi": t, "replayed": true})
 		return
 	}
+	occ, perr := parseOccurred(in.OccurredAt, time.Now())
+	if perr != nil {
+		occ = time.Now()
+	}
 	var t transaksi
 	err := platform.InTx(ctx, s.db, func(tx pgx.Tx) error {
 		k, err := lockRekening(ctx, tx, in.NoRekening)
 		if err != nil {
 			return err
 		}
-		t, err = s.post(ctx, tx, &k, postIn{Jenis: "bayar_belanja", Nominal: in.Nominal, Kanal: "ecommerce", OccurredAt: time.Now(),
+		t, err = s.post(ctx, tx, &k, postIn{Jenis: "bayar_belanja", Nominal: in.Nominal, Kanal: "ecommerce", OccurredAt: occ,
 			RefOrderID: &in.OrderID, Keterangan: "belanja toko " + in.OrderID})
 		return err
 	})

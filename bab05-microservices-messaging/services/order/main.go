@@ -63,6 +63,13 @@ func main() {
 		  IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'dbz_orders') THEN
 		    CREATE PUBLICATION dbz_orders FOR TABLE orders, order_history;
 		  END IF;
+		END $$`,
+		// REPLICA IDENTITY FULL: status order di-UPDATE oleh saga; Debezium membawa "before" lengkap.
+		// order_history insert-only. ALTER hanya bila belum FULL (idempotent).
+		`DO $$ BEGIN
+		  IF (SELECT relreplident FROM pg_class WHERE oid = 'orders'::regclass) <> 'f' THEN
+		    ALTER TABLE orders REPLICA IDENTITY FULL;
+		  END IF;
 		END $$`); err != nil {
 		log.Error("migrate", "err", err)
 		return
@@ -197,11 +204,21 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Card     string          `json:"card"`
 		// NoRekening: bayar dari rekening bank (service bank). Kosong = mode kartu lama.
 		NoRekening string `json:"no_rekening"`
+		// OccurredAt (opsional, RFC3339) = waktu bisnis checkout: orders.created_at/updated_at,
+		// riwayat T1, dan occurred_at di payload event saga. Kosong = sekarang; lampau boleh
+		// (backfill DE); > 5 menit ke depan ditolak 400 (aturan sama dengan transaksi bank).
+		OccurredAt string `json:"occurred_at"`
 	}
 	if err := platform.ReadJSON(r, &in); err != nil || len(in.Items) == 0 || len(in.Items) > 10 {
 		platform.WriteJSON(w, 400, map[string]any{"error": "body harus berisi 1-10 items"})
 		return
 	}
+	occ, err := platform.ParseOccurred(in.OccurredAt, time.Now())
+	if err != nil {
+		platform.WriteJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	occ = occ.UTC()
 	if in.Customer == "" {
 		in.Customer = "pembeli-demo"
 	}
@@ -281,23 +298,24 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Satu transaksi lokal: pesanan PENDING + riwayat + event di outbox (T1).
 	o := order{ID: "ord-" + platform.NewID()[:8], Customer: in.Customer, Items: in.Items, Total: total, Card: in.Card, NoRek: in.NoRekening,
-		Status: StatusPending, RequestID: platform.RequestID(ctx), ServedBy: a.replica, Precheck: precheck}
+		Status: StatusPending, RequestID: platform.RequestID(ctx), ServedBy: a.replica, Precheck: precheck,
+		CreatedAt: occ, UpdatedAt: occ}
 	var keyArg any
 	if key != "" {
 		keyArg = key
 	}
 	err = platform.InTx(ctx, a.db, func(tx pgx.Tx) error {
 		items, _ := json.Marshal(o.Items)
-		if _, err := tx.Exec(ctx, `INSERT INTO orders (id, idempotency_key, customer, items, total, card, status, request_id, served_by, precheck, no_rekening)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, o.ID, keyArg, o.Customer, items, o.Total, o.Card, o.Status, o.RequestID, o.ServedBy, o.Precheck, o.NoRek); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO orders (id, idempotency_key, customer, items, total, card, status, request_id, served_by, precheck, no_rekening, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`, o.ID, keyArg, o.Customer, items, o.Total, o.Card, o.Status, o.RequestID, o.ServedBy, o.Precheck, o.NoRek, occ); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO order_history (order_id, status, note, by_replica) VALUES ($1,$2,$3,$4)`,
-			o.ID, o.Status, "T1 pesanan dibuat", a.replica); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO order_history (order_id, status, note, by_replica, at) VALUES ($1,$2,$3,$4,$5)`,
+			o.ID, o.Status, "T1 pesanan dibuat", a.replica, occ); err != nil {
 			return err
 		}
 		_, err := platform.Enqueue(ctx, tx, platform.SubjOrderCreated, platform.OrderEvent{OrderID: o.ID,
-			Customer: o.Customer, Items: o.Items, Total: o.Total, Card: o.Card, NoRekening: o.NoRek})
+			Customer: o.Customer, Items: o.Items, Total: o.Total, Card: o.Card, NoRekening: o.NoRek, OccurredAt: &occ})
 		return err
 	})
 	var pgErr *pgconn.PgError

@@ -1,5 +1,7 @@
 package platform
 
+import "time"
+
 // Subject event saga (JetStream stream SHOP). Nama event berbentuk lampau: fakta yang sudah terjadi.
 const (
 	SubjOrderCreated      = "shop.order.created"      // T1 order -> inventory
@@ -30,6 +32,10 @@ type OrderEvent struct {
 	// NoRekening diisi bila pembeli membayar dari rekening bank (service bank); kosong = kartu.
 	NoRekening string `json:"no_rekening,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	// OccurredAt = waktu bisnis checkout (occurred_at opsional di POST /orders; kosong = waktu
+	// server). Dibawa apa adanya oleh semua event saga order yang sama. Field tambahan: event lama
+	// tanpa field ini tetap terbaca (nil).
+	OccurredAt *time.Time `json:"occurred_at,omitempty"`
 }
 
 // Product adalah produk katalog. Daftar yang sama dipakai catalog (harga, OpenSearch)

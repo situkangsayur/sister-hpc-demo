@@ -136,6 +136,21 @@ check "seed cabang >= 8 di beberapa kota" "api ${GW}/api/bank/cabang | jq -e 'le
 N=$(bpost /nasabah '{"nama":"Mahasiswa Uji","nik":"3201010101010001","no_hp":"0811","email":"uji@contoh.id","kota":"Bogor","segmen":"ritel","cabang_id":3}')
 NID=$(echo "$N" | jq -r .id)
 check "daftar nasabah -> CIF dibuat" "echo '$N' | jq -e '.cif|startswith(\"CIF\")' >/dev/null"
+# occurred_at opsional pada entitas (backfill DE): waktu lampau dipakai untuk kolom waktu bisnis dan event.
+OCCN=$(date -u -d '10 days ago' +%Y-%m-%dT%H:%M:%SZ)
+NB=$(bpost /nasabah "{\"nama\":\"Nasabah Backfill\",\"kota\":\"Medan\",\"segmen\":\"ritel\",\"cabang_id\":7,\"occurred_at\":\"${OCCN}\"}")
+NBID=$(echo "$NB" | jq -r .id)
+check "nasabah occurred_at 10 hari lalu -> created_at = updated_at = occurred_at" \
+  "echo '$NB' | jq -e '(.created_at|startswith(\"${OCCN%Z}\")) and .updated_at==.created_at' >/dev/null"
+check "event bank.nasabah.dibuat membawa occurred_at lampau" \
+  "tunggu 5 'last bank.nasabah.dibuat | jq -e \".data.data.id==\\\"${NBID}\\\" and (.data.occurred_at|startswith(\\\"${OCCN%Z}\\\"))\"'"
+FUT=$(date -u -d '1 hour' +%Y-%m-%dT%H:%M:%SZ)
+check "nasabah occurred_at 1 jam ke depan ditolak 400" \
+  "[ \"\$(curl -s -o /dev/null -w %{http_code} -H 'apikey: ${KEY}' -H 'content-type: application/json' -X POST -d '{\"nama\":\"Masa Depan\",\"occurred_at\":\"${FUT}\"}' ${GW}/api/bank/nasabah)\" = 400 ]"
+check "rekening occurred_at lampau -> dibuka_at lampau, setoran awal ikut tanggal itu" \
+  "bpost /rekening '{\"nasabah_id\":\"${NBID}\",\"jenis\":\"tabungan_wadiah\",\"setoran_awal\":50000,\"occurred_at\":\"${OCCN}\"}' | jq -e '.dibuka_at|startswith(\"${OCCN%Z}\")' >/dev/null && tunggu 5 'last bank.transaksi.dibuat | jq -e \".data.data.nominal==50000 and (.data.occurred_at|startswith(\\\"${OCCN%Z}\\\"))\"'"
+check "pengajuan akad occurred_at lampau -> diajukan_at lampau" \
+  "bpost /akad '{\"nasabah_id\":\"${NBID}\",\"kode_akad\":\"IJR\",\"pokok\":100000,\"margin\":5000,\"tenor_bulan\":2,\"occurred_at\":\"${OCCN}\"}' | jq -e '.akad.diajukan_at|startswith(\"${OCCN%Z}\")' >/dev/null"
 K=$(bpost /rekening "{\"nasabah_id\":\"${NID}\",\"jenis\":\"tabungan_wadiah\",\"setoran_awal\":500000}")
 REK=$(echo "$K" | jq -r .no_rekening)
 check "buka rekening ${REK} dengan setoran awal 500.000" "[ \"\$(saldo ${REK})\" = 500000 ]"
@@ -180,6 +195,21 @@ check "saldo Citra tetap dan stok P009 kembali" \
   "[ \"\$(saldo ${CIT})\" = ${S_CIT} ] && tunggu 10 '[ \"\$(api ${GW}/api/monitor/stock | jq \".[]|select(.product_id==\\\"P009\\\").available\")\" = ${STOK9} ]'"
 check "alasan batal menyebut saldo tidak cukup" "api ${GW}/api/orders/${OIDK} | jq -e '.order.reason|test(\"saldo tidak cukup\")' >/dev/null"
 
+echo "== checkout dengan occurred_at lampau (backfill DE)"
+lastshop() { api "${GW}/api/monitor/streams/SHOP/last?subject=$1"; }
+OCCO=$(date -u -d '5 days ago' +%Y-%m-%dT%H:%M:%SZ)
+R=$(post /api/orders "{\"items\":[{\"product_id\":\"P003\",\"qty\":1}],\"no_rekening\":\"${REK}\",\"occurred_at\":\"${OCCO}\"}" -H "Idempotency-Key: uji-occ-$$")
+OIDO=$(echo "$R" | jq -r .order.id)
+check "checkout occurred_at 5 hari lalu -> respons created_at lampau" "echo '$R' | jq -e '.order.created_at|startswith(\"${OCCO%Z}\")' >/dev/null"
+check "event shop.order.created membawa occurred_at lampau (field tambahan)" \
+  "tunggu 5 'lastshop shop.order.created | jq -e \".data.order_id==\\\"${OIDO}\\\" and (.data.occurred_at|startswith(\\\"${OCCO%Z}\\\"))\"'"
+check "saga ${OIDO} CONFIRMED, orders.created_at tetap lampau" \
+  "tunggu 30 '[ \"\$(saga ${OIDO})\" = CONFIRMED ]' && api ${GW}/api/orders/${OIDO} | jq -e '.order.created_at|startswith(\"${OCCO%Z}\")' >/dev/null"
+check "bayar_belanja ${OIDO} tercatat pada tanggal checkout" \
+  "api ${GW}/api/bank/rekening/${REK}/mutasi | jq -e '[.[]|select(.ref_order_id==\"${OIDO}\" and (.occurred_at|startswith(\"${OCCO%Z}\")))]|length==1' >/dev/null"
+check "checkout occurred_at 1 jam ke depan ditolak 400" \
+  "[ \"\$(curl -s -o /dev/null -w %{http_code} -H 'apikey: ${KEY}' -H 'content-type: application/json' -X POST -d '{\"items\":[{\"product_id\":\"P003\",\"qty\":1}],\"occurred_at\":\"${FUT}\"}' ${GW}/api/orders)\" = 400 ]"
+
 echo "== event BANK (kontrak data DE)"
 check "stream BANK ada dan berisi event" "api ${GW}/api/monitor/streams | jq -e '.[]|select(.name==\"BANK\")|.messages>=10' >/dev/null"
 L=$(last bank.transaksi.dibuat)
@@ -197,6 +227,24 @@ check "SHOW wal_level = logical" "[ \"\$(pgq postgres 'SHOW wal_level')\" = logi
 check "max_replication_slots dan max_wal_senders >= 4" "[ \"\$(pgq postgres 'SHOW max_replication_slots')\" -ge 4 ] && [ \"\$(pgq postgres 'SHOW max_wal_senders')\" -ge 4 ]"
 check "role ${DEBEZIUM_USER:-debezium} punya hak REPLICATION" "[ \"\$(pgq postgres \"SELECT rolreplication FROM pg_roles WHERE rolname='${DEBEZIUM_USER:-debezium}'\")\" = t ]"
 check "publication dbz_bank berisi 5 tabel bank" "[ \"\$(pgq bank \"SELECT count(*) FROM pg_publication_tables WHERE pubname='dbz_bank'\")\" = 5 ]"
+check "REPLICA IDENTITY FULL (relreplident='f') pada nasabah, rekening, akad_pembiayaan" \
+  "[ \"\$(pgq bank \"SELECT string_agg(relname::text || '=' || relreplident::text, ',' ORDER BY relname) FROM pg_class WHERE relkind='r' AND relname IN ('nasabah','rekening','akad_pembiayaan')\")\" = 'akad_pembiayaan=f,nasabah=f,rekening=f' ]"
+check "REPLICA IDENTITY FULL pada orders" "[ \"\$(pgq orders \"SELECT relreplident FROM pg_class WHERE relkind='r' AND relname='orders'\")\" = f ]"
+# Bukti "before" terisi: slot test_decoding sementara merekam UPDATE nasabah. Dengan REPLICA IDENTITY
+# FULL baris lama lengkap ada di WAL (old-key), sumber field "before" pada envelope Debezium.
+before_nasabah() {
+  local occ chg
+  occ=$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ)
+  pgq bank "SELECT 1 FROM pg_create_logical_replication_slot('uji_before', 'test_decoding')" >/dev/null || return 1
+  curl -s -H "apikey: ${KEY}" -H 'content-type: application/json' -X PATCH \
+    -d "{\"kota\":\"Binjai\",\"occurred_at\":\"${occ}\"}" "${GW}/api/bank/nasabah/${NBID}" >/dev/null
+  chg=$(pgq bank "SELECT data FROM pg_logical_slot_get_changes('uji_before', NULL, NULL) WHERE data LIKE 'table public.nasabah: UPDATE:%'")
+  pgq bank "SELECT pg_drop_replication_slot('uji_before')" >/dev/null
+  echo "$chg" | grep -q "old-key:.*kota\[text\]:'Medan'.*new-tuple:.*kota\[text\]:'Binjai'" || return 1
+  api "${GW}/api/bank/nasabah/${NBID}" | jq -e --arg o "${occ%Z}" '.nasabah.updated_at|startswith($o)' >/dev/null || return 1
+  tunggu 5 "last bank.nasabah.diperbarui | jq -e '.data.data.kota==\"Binjai\" and (.data.occurred_at|startswith(\"${occ%Z}\"))'"
+}
+check "update nasabah: WAL membawa baris lama (before kota Medan), updated_at/event = occurred_at PATCH" before_nasabah
 check "publication dbz_orders berisi tabel orders" "[ \"\$(pgq orders \"SELECT count(*) FROM pg_publication_tables WHERE pubname='dbz_orders' AND tablename='orders'\")\" = 1 ]"
 check "role debezium dapat SELECT transaksi dan membuat slot logical (pgoutput)" \
   "docker compose exec -T -e PGPASSWORD=\"${DEBEZIUM_PASSWORD:-changeme-debezium}\" postgres psql -h 127.0.0.1 -U ${DEBEZIUM_USER:-debezium} -d bank -tAc 'SELECT count(*) FROM transaksi' >/dev/null && docker compose exec -T -e PGPASSWORD=\"${DEBEZIUM_PASSWORD:-changeme-debezium}\" postgres psql 'host=127.0.0.1 dbname=bank replication=database user=${DEBEZIUM_USER:-debezium}' -c 'CREATE_REPLICATION_SLOT uji_tmp TEMPORARY LOGICAL pgoutput' | grep -q uji_tmp"

@@ -111,7 +111,12 @@ func decide(card string, failRate, roll float64) (ok bool, reason string) {
 // chargeBank mendebit rekening lewat bank (POST /internal/bayar-belanja) dengan timeout dan
 // retry + backoff. 4xx = keputusan bisnis (ok=false, mis. saldo kurang); 5xx/jaringan = err.
 func (a *app) chargeBank(ctx context.Context, ev platform.OrderEvent) (ok bool, reason string, err error) {
-	body, _ := json.Marshal(map[string]any{"no_rekening": ev.NoRekening, "order_id": ev.OrderID, "nominal": ev.Total})
+	payload := map[string]any{"no_rekening": ev.NoRekening, "order_id": ev.OrderID, "nominal": ev.Total}
+	if ev.OccurredAt != nil {
+		// Waktu checkout ikut ke bank: transaksi bayar_belanja hasil backfill berada di tanggal order.
+		payload["occurred_at"] = ev.OccurredAt.UTC().Format(time.RFC3339Nano)
+	}
+	body, _ := json.Marshal(payload)
 	err = platform.Retry(ctx, 3, 200*time.Millisecond, time.Second, func(int) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.bankURL+"/internal/bayar-belanja", bytes.NewReader(body))
 		if err != nil {

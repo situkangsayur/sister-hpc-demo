@@ -59,6 +59,17 @@ var schema = []string{
 	    CREATE PUBLICATION dbz_bank FOR TABLE cabang, nasabah, rekening, transaksi, akad_pembiayaan;
 	  END IF;
 	END $$`,
+	// REPLICA IDENTITY FULL: WAL menyimpan seluruh baris lama saat UPDATE/DELETE, sehingga envelope
+	// Debezium membawa "before" lengkap (bahan SCD-2 dim_nasabah). Hanya tabel yang di-UPDATE;
+	// transaksi dan cabang insert-only. ALTER hanya dijalankan bila belum FULL (idempotent, tanpa
+	// lock ACCESS EXCLUSIVE setiap kali service start).
+	`DO $$ DECLARE t text; BEGIN
+	  FOREACH t IN ARRAY ARRAY['nasabah','rekening','akad_pembiayaan'] LOOP
+	    IF (SELECT relreplident FROM pg_class WHERE oid = t::regclass) <> 'f' THEN
+	      EXECUTE format('ALTER TABLE %I REPLICA IDENTITY FULL', t);
+	    END IF;
+	  END LOOP;
+	END $$`,
 }
 
 // ---------- baris entitas (tag JSON = nama kolom, dipakai juga sebagai data event) ----------
@@ -267,11 +278,18 @@ type nasabahIn struct {
 	Kota     string `json:"kota"`
 	Segmen   string `json:"segmen"`
 	CabangID int    `json:"cabang_id"`
+	// OccurredAt (opsional, RFC3339) = waktu bisnis pendaftaran: created_at, updated_at, dan
+	// occurred_at event. Kosong = sekarang; lampau boleh (backfill); > 5 menit ke depan ditolak.
+	OccurredAt string `json:"occurred_at"`
 }
 
 func (s *svc) insertNasabah(ctx context.Context, tx pgx.Tx, in nasabahIn) (nasabah, error) {
 	if strings.TrimSpace(in.Nama) == "" {
 		return nasabah{}, bad(400, "nama wajib diisi")
+	}
+	occ, err := parseOccurred(in.OccurredAt, time.Now())
+	if err != nil {
+		return nasabah{}, err
 	}
 	if in.Segmen == "" {
 		in.Segmen = "ritel"
@@ -283,9 +301,9 @@ func (s *svc) insertNasabah(ctx context.Context, tx pgx.Tx, in nasabahIn) (nasab
 	if in.CabangID != 0 {
 		cab = &in.CabangID
 	}
-	n, err := scanNasabah(tx.QueryRow(ctx, `INSERT INTO nasabah (id, cif, nama, nik, no_hp, email, kota, segmen, cabang_id)
-		VALUES ($1, 'CIF' || lpad(nextval('cif_seq')::text, 8, '0'), $2,$3,$4,$5,$6,$7,$8) RETURNING `+nasabahCols,
-		platform.NewID(), strings.TrimSpace(in.Nama), nullable(in.NIK), nullable(in.NoHP), nullable(in.Email), nullable(in.Kota), in.Segmen, cab))
+	n, err := scanNasabah(tx.QueryRow(ctx, `INSERT INTO nasabah (id, cif, nama, nik, no_hp, email, kota, segmen, cabang_id, created_at, updated_at)
+		VALUES ($1, 'CIF' || lpad(nextval('cif_seq')::text, 8, '0'), $2,$3,$4,$5,$6,$7,$8,$9,$9) RETURNING `+nasabahCols,
+		platform.NewID(), strings.TrimSpace(in.Nama), nullable(in.NIK), nullable(in.NoHP), nullable(in.Email), nullable(in.Kota), in.Segmen, cab, occ))
 	if isFK(err) {
 		return n, bad(400, "cabang_id %d tidak ada", in.CabangID)
 	}
@@ -302,11 +320,17 @@ type nasabahPatch struct {
 	NoHP     *string `json:"no_hp"`
 	Email    *string `json:"email"`
 	CabangID *int    `json:"cabang_id"`
+	// OccurredAt (opsional) = waktu bisnis perubahan profil: updated_at dan occurred_at event.
+	OccurredAt string `json:"occurred_at"`
 }
 
 func (s *svc) updateNasabah(ctx context.Context, id string, p nasabahPatch) (n nasabah, err error) {
 	if p.Segmen != nil && !contains(Segmen, *p.Segmen) {
 		return n, bad(400, "segmen harus salah satu dari %v", Segmen)
+	}
+	occ, err := parseOccurred(p.OccurredAt, time.Now())
+	if err != nil {
+		return n, err
 	}
 	err = platform.InTx(ctx, s.db, func(tx pgx.Tx) error {
 		cur, err := scanNasabah(tx.QueryRow(ctx, `SELECT `+nasabahCols+` FROM nasabah WHERE id::text=$1 OR cif=$1 FOR UPDATE`, id))
@@ -331,8 +355,8 @@ func (s *svc) updateNasabah(ctx context.Context, id string, p nasabahPatch) (n n
 		if p.CabangID != nil {
 			cur.CabangID = p.CabangID
 		}
-		n, err = scanNasabah(tx.QueryRow(ctx, `UPDATE nasabah SET kota=$2, segmen=$3, no_hp=$4, email=$5, cabang_id=$6, updated_at=now()
-			WHERE id=$1 RETURNING `+nasabahCols, cur.ID, cur.Kota, cur.Segmen, cur.NoHP, cur.Email, cur.CabangID))
+		n, err = scanNasabah(tx.QueryRow(ctx, `UPDATE nasabah SET kota=$2, segmen=$3, no_hp=$4, email=$5, cabang_id=$6, updated_at=$7
+			WHERE id=$1 RETURNING `+nasabahCols, cur.ID, cur.Kota, cur.Segmen, cur.NoHP, cur.Email, cur.CabangID, occ))
 		if isFK(err) {
 			return bad(400, "cabang_id tidak ada")
 		}
@@ -353,6 +377,9 @@ type rekeningIn struct {
 	SetoranAwal int64  `json:"setoran_awal"`
 	CabangID    int    `json:"cabang_id"`
 	Kanal       string `json:"kanal"`
+	// OccurredAt (opsional) = waktu bisnis pembukaan: dibuka_at, updated_at, occurred_at event
+	// bank.rekening.dibuka, dan occurred_at setoran awal.
+	OccurredAt string `json:"occurred_at"`
 }
 
 func (s *svc) insertRekening(ctx context.Context, tx pgx.Tx, nb nasabah, in rekeningIn) (rekening, error) {
@@ -362,13 +389,17 @@ func (s *svc) insertRekening(ctx context.Context, tx pgx.Tx, nb nasabah, in reke
 	if !contains(JenisRekening, in.Jenis) {
 		return rekening{}, bad(400, "jenis rekening harus salah satu dari %v", JenisRekening)
 	}
+	occ, err := parseOccurred(in.OccurredAt, time.Now())
+	if err != nil {
+		return rekening{}, err
+	}
 	cab := nb.CabangID
 	if in.CabangID != 0 {
 		cab = &in.CabangID
 	}
-	k, err := scanRekening(tx.QueryRow(ctx, `INSERT INTO rekening (id, no_rekening, nasabah_id, jenis, cabang_id)
-		VALUES ($1, $2 || lpad(nextval('rekening_seq')::text, 9, '0'), $3, $4, $5) RETURNING `+rekeningCols,
-		platform.NewID(), prefixRekening(in.Jenis), nb.ID, in.Jenis, cab))
+	k, err := scanRekening(tx.QueryRow(ctx, `INSERT INTO rekening (id, no_rekening, nasabah_id, jenis, cabang_id, dibuka_at, updated_at)
+		VALUES ($1, $2 || lpad(nextval('rekening_seq')::text, 9, '0'), $3, $4, $5, $6, $6) RETURNING `+rekeningCols,
+		platform.NewID(), prefixRekening(in.Jenis), nb.ID, in.Jenis, cab, occ))
 	if isFK(err) {
 		return k, bad(400, "cabang_id tidak ada")
 	}
@@ -504,11 +535,17 @@ type akadIn struct {
 	Pokok      int64  `json:"pokok"`
 	Margin     int64  `json:"margin"`
 	TenorBulan int    `json:"tenor_bulan"`
+	// OccurredAt (opsional) = waktu bisnis pengajuan: diajukan_at, updated_at, occurred_at event.
+	OccurredAt string `json:"occurred_at"`
 }
 
 func (s *svc) ajukanAkad(ctx context.Context, in akadIn) (a akad, err error) {
 	if in.Pokok <= 0 || in.TenorBulan <= 0 || in.Margin < 0 {
 		return a, bad(400, "pokok > 0, margin >= 0, tenor_bulan > 0")
+	}
+	occ, err := parseOccurred(in.OccurredAt, time.Now())
+	if err != nil {
+		return a, err
 	}
 	err = platform.InTx(ctx, s.db, func(tx pgx.Tx) error {
 		var nid string
@@ -531,8 +568,8 @@ func (s *svc) ajukanAkad(ctx context.Context, in akadIn) (a akad, err error) {
 			}
 		}
 		// kode_akad disimpan APA ADANYA (tanpa validasi), sesuai kontrak data.
-		a, err = scanAkad(tx.QueryRow(ctx, `INSERT INTO akad_pembiayaan (id, nasabah_id, rekening_id, kode_akad, pokok, margin, tenor_bulan)
-			VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING `+akadCols, platform.NewID(), nid, rek, in.KodeAkad, in.Pokok, in.Margin, in.TenorBulan))
+		a, err = scanAkad(tx.QueryRow(ctx, `INSERT INTO akad_pembiayaan (id, nasabah_id, rekening_id, kode_akad, pokok, margin, tenor_bulan, diajukan_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) RETURNING `+akadCols, platform.NewID(), nid, rek, in.KodeAkad, in.Pokok, in.Margin, in.TenorBulan, occ))
 		if err != nil {
 			return err
 		}
@@ -612,16 +649,14 @@ func (s *svc) aksiAkad(ctx context.Context, id, aksi string, in akadAksiIn) (a a
 			}
 			t = &tr
 		}
-		a, err = scanAkad(tx.QueryRow(ctx, `UPDATE akad_pembiayaan SET status=$2, terbayar=$3, cair_at=$4, updated_at=now()
-			WHERE id=$1 RETURNING `+akadCols, cur.ID, next, terbayar, cairAt))
+		a, err = scanAkad(tx.QueryRow(ctx, `UPDATE akad_pembiayaan SET status=$2, terbayar=$3, cair_at=$4, updated_at=$5
+			WHERE id=$1 RETURNING `+akadCols, cur.ID, next, terbayar, cairAt, occ))
 		if err != nil {
 			return err
 		}
-		when := a.UpdatedAt
-		if t != nil {
-			when = t.OccurredAt
-		}
-		_, err = platform.EnqueueEvent(ctx, tx, subj, when, a)
+		// occurred_at event = waktu bisnis aksi (occurred_at body; kosong = sekarang), juga untuk
+		// setujui/tolak, sehingga backfill siklus akad konsisten dengan transaksinya.
+		_, err = platform.EnqueueEvent(ctx, tx, subj, occ, a)
 		return err
 	})
 	return a, t, err

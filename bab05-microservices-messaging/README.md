@@ -141,8 +141,11 @@ window 2 menit). Stream `SHOP` milik toko tidak berubah.
 ### Event stream `BANK`
 
 Payload: `{"event_id": UUID, "event_type": "<subject>", "occurred_at": RFC3339, "data": {baris entitas}}`,
-header `Nats-Msg-Id = event_id` (= id outbox) dan `X-Request-Id`. `occurred_at` transaksi = waktu
-kejadian di perangkat (boleh mundur); untuk entitas lain = waktu perubahan.
+header `Nats-Msg-Id = event_id` (= id outbox) dan `X-Request-Id`. `occurred_at` = waktu bisnis: untuk
+transaksi waktu kejadian di perangkat (boleh mundur); untuk nasabah, rekening, dan akad nilai
+`occurred_at` dari body request bila dikirim, selain itu waktu perubahan. Nilai yang sama masuk ke
+kolom waktu bisnis tabel (`nasabah.created_at`/`updated_at`, `rekening.dibuka_at`,
+`akad_pembiayaan.diajukan_at`/`updated_at`), sehingga event app dan CDC jatuh di tanggal yang sama.
 
 | Subject | Kapan |
 |---|---|
@@ -185,26 +188,31 @@ Contoh isi pesan (diambil dari stream saat uji):
 | Method dan path | Isi |
 |---|---|
 | `GET /api/bank/cabang` | daftar cabang |
-| `GET /api/bank/nasabah?limit=` · `POST /api/bank/nasabah` | daftar / buat nasabah `{nama, nik, no_hp, email, kota, segmen, cabang_id}` |
-| `GET /api/bank/nasabah/{id\|cif}` · `PATCH /api/bank/nasabah/{id\|cif}` | detail (+rekening, akad) / ubah `{kota, segmen, no_hp, email, cabang_id}` |
-| `GET /api/bank/rekening?nasabah_id=` · `POST /api/bank/rekening` | daftar / buka `{nasabah_id, jenis, setoran_awal, cabang_id, kanal}` |
+| `GET /api/bank/nasabah?limit=` · `POST /api/bank/nasabah` | daftar / buat nasabah `{nama, nik, no_hp, email, kota, segmen, cabang_id, occurred_at?}` |
+| `GET /api/bank/nasabah/{id\|cif}` · `PATCH /api/bank/nasabah/{id\|cif}` | detail (+rekening, akad) / ubah `{kota, segmen, no_hp, email, cabang_id, occurred_at?}` |
+| `GET /api/bank/rekening?nasabah_id=` · `POST /api/bank/rekening` | daftar / buka `{nasabah_id, jenis, setoran_awal, cabang_id, kanal, occurred_at?}` |
 | `GET /api/bank/rekening/{id\|no}` · `GET /api/bank/rekening/{id\|no}/mutasi` | saldo / mutasi satu rekening |
 | `GET /api/bank/transaksi?limit=&since=` | mutasi semua rekening (dipakai UI mutasi live) |
 | `POST /api/bank/transaksi` | setor/tarik `{jenis, no_rekening\|rekening_id, nominal, kanal, cabang_id?, occurred_at?}` |
 | `POST /api/bank/transfer` | `{dari, ke, nominal, kanal, cabang_id?, occurred_at?}` |
-| `GET /api/bank/akad?nasabah_id=` · `POST /api/bank/akad` | daftar / ajukan `{nasabah_id, rekening_id?, kode_akad, pokok, margin, tenor_bulan}` |
-| `POST /api/bank/akad/{id}/{setujui\|tolak\|cairkan\|angsuran}` | aksi akad; `angsuran` menerima `{nominal?, kanal, cabang_id, occurred_at}` |
+| `GET /api/bank/akad?nasabah_id=` · `POST /api/bank/akad` | daftar / ajukan `{nasabah_id, rekening_id?, kode_akad, pokok, margin, tenor_bulan, occurred_at?}` |
+| `POST /api/bank/akad/{id}/{setujui\|tolak\|cairkan\|angsuran}` | aksi akad, body opsional `{occurred_at?}`; `cairkan`/`angsuran` juga `{nominal?, kanal, cabang_id}` |
 | `GET /api/bank/ringkasan` | angka ringkas + isi stream BANK |
 | `GET /api/monitor/streams` · `GET /api/monitor/streams/BANK/last?subject=` | isi stream SHOP/BANK/LAB, pesan terakhir per subject (header + payload) |
 
-Aturan: `occurred_at` kosong = sekarang; boleh lampau (transaksi offline), ditolak bila > 5 menit di
-masa depan. `cabang_id` kosong = cabang rekening. Header `Idempotency-Key` membuat setor/tarik/transfer
+Aturan (berlaku untuk semua endpoint di atas dan checkout `POST /api/orders`): `occurred_at`
+(RFC3339) kosong = sekarang; boleh lampau (transaksi offline, backfill DE), ditolak 400 bila > 5 menit di
+masa depan. Klien lama yang tidak mengirim `occurred_at` tidak berubah perilakunya. `cabang_id` kosong = cabang rekening. Header `Idempotency-Key` membuat setor/tarik/transfer
 aman dikirim ulang; **tanpa** header, request ulang menjadi transaksi ganda (sengaja, bahan "data kotor"
 generator DE). Saldo kurang → HTTP 409.
 
 Debit belanja hanya lewat port internal `bank:8081` (`POST /internal/bayar-belanja`), yang tidak
 dirutekan APISIX. Checkout toko: kirim `no_rekening` di body `POST /api/orders`; tanpa `no_rekening`
-mode kartu lama (`card: ok|declined`) berjalan seperti sebelumnya. payment memanggil bank dengan timeout
+mode kartu lama (`card: ok|declined`) berjalan seperti sebelumnya. `occurred_at` opsional pada checkout
+mengisi `orders.created_at`/`updated_at` dan riwayat T1, dan ikut sebagai field tambahan `occurred_at`
+(waktu checkout, sama untuk semua event saga order itu) di payload event `SHOP`; payment meneruskannya ke
+bank sehingga transaksi `bayar_belanja` bertanggal sama. Langkah saga berikutnya (status, riwayat T4/C1)
+tetap memakai waktu proses. payment memanggil bank dengan timeout
 2 s dan retry + backoff; 4xx (saldo kurang, rekening tidak ada) = `shop.payment.failed` → kompensasi
 C2, C1; bank tidak terjangkau = event di-Nak dan dikirim ulang (bank idempotent per `order_id`).
 
@@ -216,7 +224,10 @@ C2, C1; bank tidak terjangkau = event di-Nak dan dikirim ulang (bank idempotent 
 `${DEBEZIUM_PASSWORD}` dari `.env`) dengan hak `SELECT` di database `bank` dan `orders`. Publication
 `dbz_bank` (cabang, nasabah, rekening, transaksi, akad_pembiayaan) dan `dbz_orders` (orders,
 order_history) dibuat oleh service bank dan order saat migrasi, sehingga Debezium cukup memakai
-`publication.name` dengan `publication.autocreate.mode=disabled`. Skrip init hanya berjalan pada volume
+`publication.name` dengan `publication.autocreate.mode=disabled`. Tabel yang di-UPDATE (`nasabah`,
+`rekening`, `akad_pembiayaan`, `orders`) diset `REPLICA IDENTITY FULL` oleh migrasi service (idempotent),
+sehingga envelope Debezium untuk update membawa `before` lengkap (bahan SCD-2); tabel insert-only
+(`transaksi`, `cabang`, `order_history`) tetap `DEFAULT`. Skrip init hanya berjalan pada volume
 baru: sesudah mengubah password, jalankan `docker compose down -v`.
 
 ## Port
@@ -251,7 +262,7 @@ Bila hanya sebagian service dibuat ulang (mis. `docker compose up -d --build ui`
 service Go), APISIX dan nginx masih memegang IP lama hasil resolve DNS dan menjawab 404/502. Jalankan
 `docker compose restart apisix order-lb`.
 
-Uji otomatis (build, start, 70-an pemeriksaan termasuk bank dan kesiapan CDC, lalu `down -v`):
+Uji otomatis (build, start, 83 pemeriksaan termasuk bank, backfill `occurred_at`, dan kesiapan CDC seperti `REPLICA IDENTITY FULL`, lalu `down -v`):
 
 ```bash
 bash uji.sh

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"slices"
 	"time"
+
+	"sister-bab05/services/platform"
 )
 
 // Nilai enum mengikuti kontrak data DE (de-demo/platform/KONTRAK-DATA.md). Jangan diubah
@@ -64,15 +66,9 @@ func applySaldo(saldo int64, jenis string, nominal int64) (int64, error) {
 // parseOccurred membaca occurred_at dari klien. Kosong = sekarang. Waktu lampau boleh
 // (transaksi offline perangkat yang baru tersinkron = data terlambat); masa depan > 5 menit ditolak.
 func parseOccurred(s string, now time.Time) (time.Time, error) {
-	if s == "" {
-		return now, nil
-	}
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := platform.ParseOccurred(s, now)
 	if err != nil {
-		return time.Time{}, bad(400, "occurred_at harus RFC3339, mis. 2026-11-20T08:15:00+07:00")
-	}
-	if t.After(now.Add(5 * time.Minute)) {
-		return time.Time{}, bad(400, "occurred_at tidak boleh di masa depan")
+		return time.Time{}, bad(400, "%s", err.Error())
 	}
 	return t, nil
 }
