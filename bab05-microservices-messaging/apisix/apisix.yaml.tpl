@@ -17,6 +17,10 @@ upstreams:
     type: roundrobin
     nodes:
       "monitor:8080": 1
+  - id: bank
+    type: roundrobin
+    nodes:
+      "bank:8080": 1
 
 consumers:
   - username: storefront
@@ -90,4 +94,16 @@ routes:
         hide_credentials: true
       proxy-rewrite:
         regex_uri: ["^/api/monitor/(.*)", "/$1"]
+
+  # Layanan bank (bank + e-commerce). Port internal bank 8081 (debit belanja) TIDAK dirutekan.
+  - id: bank
+    uris: ["/api/bank/*"]
+    methods: [GET, POST, PATCH]
+    upstream_id: bank
+    plugins:
+      key-auth:
+        header: apikey
+        hide_credentials: true
+      proxy-rewrite:
+        regex_uri: ["^/api/bank/(.*)", "/$1"]
 #END

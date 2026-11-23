@@ -46,3 +46,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
 export async function POST(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
   return proxy(req, (await ctx.params).path);
 }
+
+export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: string[] }> }) {
+  return proxy(req, (await ctx.params).path);
+}

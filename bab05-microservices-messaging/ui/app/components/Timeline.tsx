@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Ev, getJSON, shortTime } from "../lib";
 
-const LANES = ["order", "inventory", "payment", "notification", "monitor"];
+const LANES = ["order", "inventory", "payment", "bank", "notification", "monitor"];
 
 function laneIndex(s: string) {
   const i = LANES.indexOf(s);
@@ -19,6 +19,7 @@ function subjectClass(e: Ev) {
     if (e.action === "breaker" || e.action === "replica") return "s-warn";
     return "s-audit";
   }
+  if (e.subject.startsWith("bank.")) return "s-bank";
   if (/failed|rejected|cancelled|released/.test(e.subject)) return "s-bad";
   return "s-ok";
 }
@@ -28,6 +29,8 @@ export default function Timeline({ filter, setFilter }: { filter: string; setFil
   const [events, setEvents] = useState<Ev[]>([]);
   const [showLab, setShowLab] = useState(false);
   const [showAudit, setShowAudit] = useState(true);
+  const [showShop, setShowShop] = useState(true);
+  const [showBank, setShowBank] = useState(true);
   const [paused, setPaused] = useState(false);
   const last = useRef(0);
 
@@ -49,7 +52,12 @@ export default function Timeline({ filter, setFilter }: { filter: string; setFil
   }, [paused]);
 
   const shown = events.filter(
-    (e) => (showLab || e.kind !== "lab") && (showAudit || e.kind !== "audit") && (!filter || e.order_id === filter || e.request_id === filter),
+    (e) =>
+      (showLab || e.kind !== "lab") &&
+      (showAudit || e.kind !== "audit") &&
+      (showShop || !e.subject.startsWith("shop.")) &&
+      (showBank || !(e.subject.startsWith("bank.") || e.from === "bank")) &&
+      (!filter || e.order_id === filter || e.request_id === filter),
   );
 
   return (
@@ -58,11 +66,18 @@ export default function Timeline({ filter, setFilter }: { filter: string; setFil
       <p className="hint">
         Baris <span className="tag s-ok">publish</span> = event diterbitkan ke JetStream (dari outbox). Baris <span className="tag s-audit">audit</span> = consumer
         memprosesnya; <span className="tag s-warn">redelivered</span>, <span className="tag s-dup">duplicate</span>, <span className="tag s-bad">crash</span> memperlihatkan
-        delivery semantics.
+        delivery semantics. <span className="tag s-bank">bank.*</span> = event stream BANK (transaksi, nasabah, rekening, akad); transaksi bayar_belanja ikut tersaring bersama
+        order yang dibayarnya.
       </p>
       <div className="row wrap">
         <label>
           <input type="checkbox" checked={showAudit} onChange={(e) => setShowAudit(e.target.checked)} /> audit consumer
+        </label>
+        <label>
+          <input type="checkbox" checked={showShop} onChange={(e) => setShowShop(e.target.checked)} /> event SHOP
+        </label>
+        <label>
+          <input type="checkbox" checked={showBank} onChange={(e) => setShowBank(e.target.checked)} /> event BANK
         </label>
         <label>
           <input type="checkbox" checked={showLab} onChange={(e) => setShowLab(e.target.checked)} /> pesan lab

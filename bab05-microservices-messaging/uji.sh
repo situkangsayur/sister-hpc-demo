@@ -127,11 +127,87 @@ post /api/monitor/lab/offline '{"offline":false}' >/dev/null
 check "penerima online: 10 pesan JetStream diterima, 10 pesan core hilang" \
   "tunggu 10 'api ${GW}/api/monitor/lab/stats | jq -e \".receiver.received[\\\"js-worker\\\"]==10 and ((.receiver.received[\\\"worker-a\\\"]//0)+(.receiver.received[\\\"worker-b\\\"]//0))==0\"'"
 
+echo "== layanan bank (APISIX /api/bank/* -> bank, database bank, stream BANK)"
+bpost() { local path=$1 body=$2; shift 2; curl -s -H "apikey: ${KEY}" -H 'content-type: application/json' -X POST -d "$body" "$@" "${GW}/api/bank${path}"; }
+saldo() { api "${GW}/api/bank/rekening/$1" | jq -r .saldo; }
+last() { api "${GW}/api/monitor/streams/BANK/last?subject=$1"; }
+check "GET /api/bank/cabang tanpa apikey ditolak 401" "[ \"\$(curl -s -o /dev/null -w %{http_code} ${GW}/api/bank/cabang)\" = 401 ]"
+check "seed cabang >= 8 di beberapa kota" "api ${GW}/api/bank/cabang | jq -e 'length>=8 and ([.[].kota]|unique|length)>=6' >/dev/null"
+N=$(bpost /nasabah '{"nama":"Mahasiswa Uji","nik":"3201010101010001","no_hp":"0811","email":"uji@contoh.id","kota":"Bogor","segmen":"ritel","cabang_id":3}')
+NID=$(echo "$N" | jq -r .id)
+check "daftar nasabah -> CIF dibuat" "echo '$N' | jq -e '.cif|startswith(\"CIF\")' >/dev/null"
+K=$(bpost /rekening "{\"nasabah_id\":\"${NID}\",\"jenis\":\"tabungan_wadiah\",\"setoran_awal\":500000}")
+REK=$(echo "$K" | jq -r .no_rekening)
+check "buka rekening ${REK} dengan setoran awal 500.000" "[ \"\$(saldo ${REK})\" = 500000 ]"
+AIS=$(api "${GW}/api/bank/rekening" | jq -r '[.[]|select(.nama=="Aisyah Rahmawati")][0].no_rekening')
+S_AIS=$(saldo "$AIS")
+T=$(bpost /transfer "{\"dari\":\"${REK}\",\"ke\":\"${AIS}\",\"nominal\":100000,\"kanal\":\"mobile\"}" -H "Idempotency-Key: uji-trf-$$")
+check "transfer 100.000 -> 2 baris (keluar+masuk, transfer_id sama)" \
+  "echo '$T' | jq -e '(.transaksi|length)==2 and .transaksi[0].transfer_id==.transaksi[1].transfer_id and .transaksi[0].jenis==\"transfer_keluar\"' >/dev/null"
+check "saldo asal 400.000 dan tujuan bertambah 100.000" "[ \"\$(saldo ${REK})\" = 400000 ] && [ \"\$(saldo ${AIS})\" = $((S_AIS + 100000)) ]"
+check "transfer ulang dengan Idempotency-Key sama -> replayed, saldo tetap" \
+  "bpost /transfer '{\"dari\":\"${REK}\",\"ke\":\"${AIS}\",\"nominal\":100000,\"kanal\":\"mobile\"}' -H 'Idempotency-Key: uji-trf-$$' | jq -e '.replayed==true' >/dev/null && [ \"\$(saldo ${REK})\" = 400000 ]"
+check "transfer melebihi saldo -> 409" \
+  "[ \"\$(curl -s -o /dev/null -w %{http_code} -H 'apikey: ${KEY}' -H 'content-type: application/json' -X POST -d '{\"dari\":\"${REK}\",\"ke\":\"${AIS}\",\"nominal\":99999999,\"kanal\":\"web\"}' ${GW}/api/bank/transfer)\" = 409 ]"
+OCC=$(date -u -d '3 days ago' +%Y-%m-%dT%H:%M:%SZ)
+check "setor offline: occurred_at mundur 3 hari disimpan apa adanya" \
+  "bpost /transaksi '{\"jenis\":\"setor\",\"no_rekening\":\"${REK}\",\"nominal\":25000,\"kanal\":\"atm\",\"cabang_id\":7,\"occurred_at\":\"${OCC}\"}' | jq -e '.transaksi.occurred_at|startswith(\"${OCC%Z}\")' >/dev/null"
+check "ubah profil (kota/segmen) -> event bank.nasabah.diperbarui" \
+  "curl -s -H 'apikey: ${KEY}' -H 'content-type: application/json' -X PATCH -d '{\"kota\":\"Depok\",\"segmen\":\"umkm\"}' ${GW}/api/bank/nasabah/${NID} | jq -e '.kota==\"Depok\"' >/dev/null && tunggu 5 'last bank.nasabah.diperbarui | jq -e \".data.data.kota==\\\"Depok\\\"\"'"
+A=$(bpost /akad "{\"nasabah_id\":\"${NID}\",\"kode_akad\":\"MRB\",\"pokok\":300000,\"margin\":30000,\"tenor_bulan\":3}")
+AID=$(echo "$A" | jq -r .akad.id)
+bpost "/akad/${AID}/setujui" '{}' >/dev/null
+check "akad MRB disetujui lalu dicairkan -> rekening +300.000" \
+  "bpost /akad/${AID}/cairkan '{}' | jq -e '.akad.status==\"cair\" and .transaksi.nominal==300000' >/dev/null && [ \"\$(saldo ${REK})\" = 725000 ]"
+check "angsuran akad -> transaksi jenis angsuran 110.000" "bpost /akad/${AID}/angsuran '{\"kanal\":\"mobile\"}' | jq -e '.transaksi.jenis==\"angsuran\" and .akad.terbayar==110000' >/dev/null"
+check "kode akad tidak valid (XYZ) tetap tersimpan apa adanya" \
+  "bpost /akad '{\"nasabah_id\":\"${NID}\",\"kode_akad\":\"XYZ\",\"pokok\":100000,\"margin\":0,\"tenor_bulan\":1}' | jq -e '.akad.kode_akad==\"XYZ\" and .kode_valid==false' >/dev/null"
+
+echo "== belanja toko dibayar dari rekening bank"
+S0=$(saldo "$REK")
+R=$(post /api/orders "{\"items\":[{\"product_id\":\"P013\",\"qty\":1}],\"no_rekening\":\"${REK}\"}" -H "Idempotency-Key: uji-rek-$$")
+OIDB=$(echo "$R" | jq -r .order.id)
+check "checkout dibayar dari rekening -> saga ${OIDB} CONFIRMED" "tunggu 30 '[ \"\$(saga ${OIDB})\" = CONFIRMED ]'"
+check "saldo ${REK} berkurang 98.000 (harga P013)" "[ \"\$(saldo ${REK})\" = $((S0 - 98000)) ]"
+check "transaksi bayar_belanja kanal ecommerce dengan ref_order_id ${OIDB}" \
+  "api ${GW}/api/bank/rekening/${REK}/mutasi | jq -e '[.[]|select(.jenis==\"bayar_belanja\" and .kanal==\"ecommerce\" and .ref_order_id==\"${OIDB}\")]|length==1' >/dev/null"
+CIT=$(api "${GW}/api/bank/rekening" | jq -r '[.[]|select(.nama=="Citra Lestari")][0].no_rekening')
+S_CIT=$(saldo "$CIT")
+STOK9=$(api "${GW}/api/monitor/stock" | jq '.[]|select(.product_id=="P009").available')
+OIDK=$(post /api/orders "{\"items\":[{\"product_id\":\"P009\",\"qty\":1}],\"no_rekening\":\"${CIT}\"}" -H "Idempotency-Key: uji-kurang-$$" | jq -r .order.id)
+check "saldo kurang -> payment gagal -> saga ${OIDK} dikompensasi" "tunggu 30 '[ \"\$(saga ${OIDK})\" = \"CANCELLED (dikompensasi)\" ]'"
+check "saldo Citra tetap dan stok P009 kembali" \
+  "[ \"\$(saldo ${CIT})\" = ${S_CIT} ] && tunggu 10 '[ \"\$(api ${GW}/api/monitor/stock | jq \".[]|select(.product_id==\\\"P009\\\").available\")\" = ${STOK9} ]'"
+check "alasan batal menyebut saldo tidak cukup" "api ${GW}/api/orders/${OIDK} | jq -e '.order.reason|test(\"saldo tidak cukup\")' >/dev/null"
+
+echo "== event BANK (kontrak data DE)"
+check "stream BANK ada dan berisi event" "api ${GW}/api/monitor/streams | jq -e '.[]|select(.name==\"BANK\")|.messages>=10' >/dev/null"
+L=$(last bank.transaksi.dibuat)
+check "payload {event_id, event_type, occurred_at, data} dan Nats-Msg-Id = event_id" \
+  "echo '$L' | jq -e '.data|has(\"event_id\") and has(\"event_type\") and has(\"occurred_at\") and has(\"data\")' >/dev/null && echo '$L' | jq -e '.headers[\"Nats-Msg-Id\"][0]==.data.event_id' >/dev/null"
+check "event bayar_belanja ${OIDB} tampil di timeline monitor" \
+  "api ${GW}/api/monitor/events?since=0 | jq -e '[.events[]|select(.subject==\"bank.transaksi.dibuat\" and .order_id==\"${OIDB}\")]|length>=1' >/dev/null"
+for subj in bank.cabang.dibuat bank.nasabah.dibuat bank.rekening.dibuka bank.akad.diajukan bank.akad.disetujui bank.akad.dicairkan bank.akad.diangsur; do
+  check "subject ${subj} terbit" "last ${subj} | jq -e '.data.event_type==\"${subj}\"' >/dev/null"
+done
+
+echo "== PostgreSQL siap untuk Debezium (CDC)"
+pgq() { docker compose exec -T postgres psql -U sister -d "$1" -tAc "$2"; }
+check "SHOW wal_level = logical" "[ \"\$(pgq postgres 'SHOW wal_level')\" = logical ]"
+check "max_replication_slots dan max_wal_senders >= 4" "[ \"\$(pgq postgres 'SHOW max_replication_slots')\" -ge 4 ] && [ \"\$(pgq postgres 'SHOW max_wal_senders')\" -ge 4 ]"
+check "role ${DEBEZIUM_USER:-debezium} punya hak REPLICATION" "[ \"\$(pgq postgres \"SELECT rolreplication FROM pg_roles WHERE rolname='${DEBEZIUM_USER:-debezium}'\")\" = t ]"
+check "publication dbz_bank berisi 5 tabel bank" "[ \"\$(pgq bank \"SELECT count(*) FROM pg_publication_tables WHERE pubname='dbz_bank'\")\" = 5 ]"
+check "publication dbz_orders berisi tabel orders" "[ \"\$(pgq orders \"SELECT count(*) FROM pg_publication_tables WHERE pubname='dbz_orders' AND tablename='orders'\")\" = 1 ]"
+check "role debezium dapat SELECT transaksi dan membuat slot logical (pgoutput)" \
+  "docker compose exec -T -e PGPASSWORD=\"${DEBEZIUM_PASSWORD:-changeme-debezium}\" postgres psql -h 127.0.0.1 -U ${DEBEZIUM_USER:-debezium} -d bank -tAc 'SELECT count(*) FROM transaksi' >/dev/null && docker compose exec -T -e PGPASSWORD=\"${DEBEZIUM_PASSWORD:-changeme-debezium}\" postgres psql 'host=127.0.0.1 dbname=bank replication=database user=${DEBEZIUM_USER:-debezium}' -c 'CREATE_REPLICATION_SLOT uji_tmp TEMPORARY LOGICAL pgoutput' | grep -q uji_tmp"
+
 echo "== UI Next.js"
 check "UI melayani halaman (HTTP 200)" "[ \"\$(curl -s -o /dev/null -w %{http_code} ${UI}/)\" = 200 ]"
 check "UI berisi judul demo" "curl -s ${UI}/ | grep -q 'Toko Daring Microservices'"
-check "API UI /api/gw/monitor/health: 12 komponen up" \
-  "curl -s ${UI}/api/gw/monitor/health | jq -e '[.[]|select(.status==\"up\")]|length==12' >/dev/null"
+check "API UI /api/gw/monitor/health: 13 komponen up (termasuk bank)" \
+  "curl -s ${UI}/api/gw/monitor/health | jq -e '[.[]|select(.status==\"up\")]|length==13' >/dev/null"
+check "API UI /api/gw/bank/rekening mengembalikan rekening" "curl -s ${UI}/api/gw/bank/rekening | jq -e 'length>=3' >/dev/null"
+check "API UI /api/gw/bank/transaksi (mutasi live) berisi transaksi" "curl -s ${UI}/api/gw/bank/transaksi | jq -e 'length>=1' >/dev/null"
 check "API UI /api/gw/monitor/saga berisi order" "curl -s ${UI}/api/gw/monitor/saga | jq -e 'length>=5' >/dev/null"
 check "API UI /api/gw/catalog/search mengembalikan produk" "curl -s '${UI}/api/gw/catalog/search?q=batik' | jq -e '.hits|length>=1' >/dev/null"
 sleep 11 # jendela rate limit sebelumnya habis

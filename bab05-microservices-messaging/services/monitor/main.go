@@ -1,5 +1,5 @@
 // Service monitor: "menara pengawas" untuk UI. Ia berlangganan semua subject NATS
-// (shop.>, audit.>, lab.>) untuk timeline dan status saga, memeriksa health setiap service
+// (shop.>, bank.>, audit.>, lab.>) untuk timeline dan status saga, memeriksa health setiap service
 // dan replica, membaca status circuit breaker, mengatur fault injection, dan menjalankan
 // lab delivery semantics (publish core NATS vs JetStream).
 package main
@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +53,7 @@ func main() {
 	a := &app{st: newStore(), nc: nc, js: js, db: db, log: log, client: &http.Client{Timeout: 1500 * time.Millisecond},
 		search:       platform.NewSearchClient(platform.Env("OPENSEARCH_URLS", "http://opensearch-1:9200,http://opensearch-2:9200")),
 		labPublished: map[string]int{}}
-	for _, subj := range []string{"shop.>", "audit.>", "lab.>"} {
+	for _, subj := range []string{"shop.>", "bank.>", "audit.>", "lab.>"} {
 		if _, err := nc.Subscribe(subj, a.onMsg); err != nil {
 			log.Error("subscribe", "err", err)
 			return
@@ -80,6 +81,8 @@ func main() {
 	mux.HandleFunc("GET /stock", a.proxyGet("http://inventory:8080/stock"))
 	mux.HandleFunc("GET /notifications", a.proxyGet("http://notification:8080/notifications"))
 	mux.HandleFunc("GET /opensearch", a.handleOpenSearch)
+	mux.HandleFunc("GET /streams", a.handleStreams)
+	mux.HandleFunc("GET /streams/{name}/last", a.handleLastMsg)
 	mux.HandleFunc("GET /lab/stats", a.handleLabStats)
 	mux.HandleFunc("POST /lab/publish", a.handleLabPublish)
 	mux.HandleFunc("POST /lab/offline", a.forward("http://notification:8080/lab/offline"))
@@ -101,6 +104,13 @@ func (a *app) onMsg(m *nats.Msg) {
 		if json.Unmarshal(m.Data, &ev) == nil {
 			e.OrderID, e.Note = ev.OrderID, ev.Reason
 		}
+	case strings.HasPrefix(m.Subject, "bank."):
+		// Event bank berbentuk envelope kontrak DE: {event_id, event_type, occurred_at, data}.
+		e.Kind, e.From = "publish", "bank"
+		if m.Header != nil {
+			e.MsgID, e.RequestID = m.Header.Get(jetstream.MsgIDHeader), m.Header.Get(platform.HeaderRequestID)
+		}
+		e.OrderID, e.Note = bankNote(m.Data)
 	case len(m.Subject) > 6 && m.Subject[:6] == "audit.":
 		var f struct {
 			Service   string `json:"service"`
@@ -189,6 +199,7 @@ var targets = []target{
 	{"catalog", "service", "http://catalog:8080/healthz"},
 	{"inventory", "service", "http://inventory:8080/healthz"},
 	{"payment", "service", "http://payment:8080/healthz"},
+	{"bank", "service", "http://bank:8080/healthz"},
 	{"notification", "service", "http://notification:8080/healthz"},
 	{"nats", "broker", "http://nats:8222/healthz?js-enabled-only=true"},
 	{"opensearch-1", "search", "http://opensearch-1:9200/"},
@@ -240,7 +251,7 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 		pg.Status, pg.Detail = "down", err.Error()
 	}
 	pg.LatencyMs = time.Since(start).Milliseconds()
-	pg.Detail = "catalog, orders, inventory, payment, notification"
+	pg.Detail = "catalog, orders, inventory, payment, notification, bank"
 	wg.Wait()
 	out[len(targets)] = pg
 	platform.WriteJSON(w, 200, out)
@@ -369,4 +380,85 @@ func (a *app) handleLabReset(w http.ResponseWriter, r *http.Request) {
 	a.labPublished = map[string]int{}
 	a.labMu.Unlock()
 	a.handleLabStats(w, r)
+}
+
+// bankNote meringkas event BANK untuk timeline; order_id diisi untuk transaksi bayar_belanja
+// sehingga event bank ikut tersaring bersama saga order yang dibayarnya.
+func bankNote(b []byte) (orderID, note string) {
+	var env struct {
+		EventID    string         `json:"event_id"`
+		OccurredAt string         `json:"occurred_at"`
+		Data       map[string]any `json:"data"`
+	}
+	if json.Unmarshal(b, &env) != nil {
+		return "", ""
+	}
+	d := env.Data
+	str := func(k string) string {
+		if v, ok := d[k].(string); ok {
+			return v
+		}
+		return ""
+	}
+	num := func(k string) string {
+		if v, ok := d[k].(float64); ok {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return "-"
+	}
+	switch {
+	case d["jenis"] != nil && d["nominal"] != nil: // transaksi
+		note = fmt.Sprintf("%s %s via %s, saldo %s, occurred_at %s", str("jenis"), num("nominal"), str("kanal"), num("saldo_setelah"), env.OccurredAt)
+		orderID = str("ref_order_id")
+	case d["kode_akad"] != nil:
+		note = fmt.Sprintf("akad %s pokok %s status %s", str("kode_akad"), num("pokok"), str("status"))
+	case d["no_rekening"] != nil:
+		note = fmt.Sprintf("rekening %s %s", str("no_rekening"), str("jenis"))
+	case d["cif"] != nil:
+		note = fmt.Sprintf("nasabah %s %s, kota %s, segmen %s", str("cif"), str("nama"), str("kota"), str("segmen"))
+	case d["wilayah"] != nil:
+		note = fmt.Sprintf("cabang %s %s", str("kode"), str("kota"))
+	}
+	return orderID, note
+}
+
+// handleStreams: isi stream JetStream SHOP, BANK, LAB (jumlah pesan, byte, consumer).
+func (a *app) handleStreams(w http.ResponseWriter, r *http.Request) {
+	out := []map[string]any{}
+	for _, n := range []string{"SHOP", "BANK", "LAB"} {
+		st, err := a.js.Stream(r.Context(), n)
+		if err != nil {
+			out = append(out, map[string]any{"name": n, "error": err.Error()})
+			continue
+		}
+		info, err := st.Info(r.Context())
+		if err != nil {
+			continue
+		}
+		out = append(out, map[string]any{"name": n, "subjects": info.Config.Subjects, "messages": info.State.Msgs,
+			"bytes": info.State.Bytes, "consumers": info.State.Consumers, "max_age_s": int64(info.Config.MaxAge.Seconds())})
+	}
+	platform.WriteJSON(w, 200, out)
+}
+
+// handleLastMsg: pesan terakhir untuk satu subject di stream (header + payload), mis.
+// GET /streams/BANK/last?subject=bank.transaksi.dibuat. Untuk melihat bentuk event kontrak DE.
+func (a *app) handleLastMsg(w http.ResponseWriter, r *http.Request) {
+	name, subj := r.PathValue("name"), r.URL.Query().Get("subject")
+	if name != "SHOP" && name != "BANK" {
+		platform.WriteJSON(w, 404, map[string]any{"error": "stream harus SHOP atau BANK"})
+		return
+	}
+	st, err := a.js.Stream(r.Context(), name)
+	if err != nil {
+		platform.WriteJSON(w, 502, map[string]any{"error": err.Error()})
+		return
+	}
+	m, err := st.GetLastMsgForSubject(r.Context(), subj)
+	if err != nil {
+		platform.WriteJSON(w, 404, map[string]any{"error": err.Error()})
+		return
+	}
+	platform.WriteJSON(w, 200, map[string]any{"subject": m.Subject, "seq": m.Sequence, "time": m.Time,
+		"headers": m.Header, "data": json.RawMessage(m.Data)})
 }

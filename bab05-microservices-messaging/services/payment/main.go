@@ -1,11 +1,17 @@
 // Service payment: pemilik data pembayaran (database "payment"). Bereaksi pada
 // shop.inventory.reserved (T3: tagih). Gagal bayar -> shop.payment.failed, yang memicu
 // kompensasi di inventory (C2) lalu order (C1). order_id unik membuat penagihan idempotent.
+// Dua mode bayar: kartu (mode lama, keputusan lokal) dan rekening bank (no_rekening terisi):
+// payment memanggil service bank secara synchronous; saldo kurang -> payment.failed -> kompensasi.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -25,6 +31,8 @@ type app struct {
 	log      *slog.Logger
 	mu       sync.Mutex
 	failRate float64
+	bankURL  string
+	client   *http.Client
 }
 
 func main() {
@@ -49,7 +57,8 @@ func main() {
 		log.Error("stream", "err", err)
 		return
 	}
-	a := &app{db: db, nc: nc, log: log}
+	a := &app{db: db, nc: nc, log: log, bankURL: platform.Env("BANK_URL", "http://bank:8081"),
+		client: &http.Client{Timeout: 2 * time.Second}}
 	go platform.RunRelay(ctx, db, js, log, nil)
 	if err := platform.Consume(ctx, js, platform.ConsumerSpec{Stream: "SHOP", Durable: "payment",
 		Filters: []string{platform.SubjInventoryReserved}}, log, nil, a.handle); err != nil {
@@ -99,6 +108,40 @@ func decide(card string, failRate, roll float64) (ok bool, reason string) {
 	return true, ""
 }
 
+// chargeBank mendebit rekening lewat bank (POST /internal/bayar-belanja) dengan timeout dan
+// retry + backoff. 4xx = keputusan bisnis (ok=false, mis. saldo kurang); 5xx/jaringan = err.
+func (a *app) chargeBank(ctx context.Context, ev platform.OrderEvent) (ok bool, reason string, err error) {
+	body, _ := json.Marshal(map[string]any{"no_rekening": ev.NoRekening, "order_id": ev.OrderID, "nominal": ev.Total})
+	err = platform.Retry(ctx, 3, 200*time.Millisecond, time.Second, func(int) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.bankURL+"/internal/bayar-belanja", bytes.NewReader(body))
+		if err != nil {
+			return errors.Join(platform.ErrPermanent, err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(platform.HeaderRequestID, platform.RequestID(ctx))
+		resp, err := a.client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		var out struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(b, &out)
+		switch {
+		case resp.StatusCode < 300:
+			ok = true
+			return nil
+		case resp.StatusCode < 500:
+			ok, reason = false, "rekening bank menolak: "+out.Error
+			return nil
+		}
+		return fmt.Errorf("bank HTTP %d: %s", resp.StatusCode, out.Error)
+	})
+	return ok, reason, err
+}
+
 func (a *app) handle(ctx context.Context, d *platform.Delivery) error {
 	var ev platform.OrderEvent
 	if err := json.Unmarshal(d.Data, &ev); err != nil {
@@ -106,6 +149,23 @@ func (a *app) handle(ctx context.Context, d *platform.Delivery) error {
 	}
 	time.Sleep(300 * time.Millisecond) // waktu "bank" memproses
 	ok, reason := decide(ev.Card, a.rate(), rand.Float64())
+	if ok && ev.NoRekening != "" {
+		var done bool
+		if err := a.db.QueryRow(ctx, `SELECT true FROM payments WHERE order_id=$1`, ev.OrderID).Scan(&done); err == nil {
+			ok = true // sudah ditagih sebelumnya; ProcessOnce di bawah tidak akan menagih ulang
+		} else {
+			var err error
+			ok, reason, err = a.chargeBank(ctx, ev)
+			if err != nil {
+				// Bank tidak terjangkau: jangan putuskan gagal (bisa saja sudah didebit). Nak ->
+				// JetStream mengirim ulang; bank idempotent per order_id sehingga aman diulang.
+				a.log.Warn("bank tidak terjangkau, event dikirim ulang nanti", "request_id", d.RequestID, "order_id", ev.OrderID, "err", err)
+				platform.Audit(a.nc, "payment", map[string]any{"action": "error", "subject": d.Subject, "msg_id": d.MsgID,
+					"order_id": ev.OrderID, "request_id": d.RequestID, "delivered": d.NumDelivered, "note": "bank tidak terjangkau: " + err.Error()})
+				return err
+			}
+		}
+	}
 	note := ""
 	dup, err := platform.ProcessOnce(ctx, a.db, "payment", d.MsgID, true, func(tx pgx.Tx) error {
 		status := "SUCCEEDED"

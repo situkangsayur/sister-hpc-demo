@@ -27,7 +27,9 @@ type OrderEvent struct {
 	Items    []Item `json:"items,omitempty"`
 	Total    int    `json:"total,omitempty"`
 	Card     string `json:"card,omitempty"`
-	Reason   string `json:"reason,omitempty"`
+	// NoRekening diisi bila pembeli membayar dari rekening bank (service bank); kosong = kartu.
+	NoRekening string `json:"no_rekening,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 // Product adalah produk katalog. Daftar yang sama dipakai catalog (harga, OpenSearch)

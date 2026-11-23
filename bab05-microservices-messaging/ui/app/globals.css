@@ -388,7 +388,7 @@ table.saga tr.sel {
 .tl-head,
 .tl-row {
   display: grid;
-  grid-template-columns: 92px 230px repeat(5, 74px) minmax(240px, 1fr);
+  grid-template-columns: 92px 230px repeat(6, 74px) minmax(240px, 1fr);
   align-items: center;
   gap: 0 4px;
   padding: 2px 6px;
@@ -560,4 +560,73 @@ table.saga tr.sel {
   .grid {
     grid-template-columns: 1fr;
   }
+}
+
+/* ---------- tab dan panel bank ---------- */
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.s-bank {
+  background: #e4f2f7;
+  color: #0b6380;
+}
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+}
+
+.kpi {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fafbfb;
+}
+
+.kval {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.formgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.formgrid input,
+.formgrid select {
+  width: 100%;
+}
+
+.scroll {
+  max-height: 260px;
+  overflow: auto;
+  margin-top: 6px;
+}
+
+.scroll.tall {
+  max-height: 420px;
+}
+
+tr.clickable {
+  cursor: pointer;
+}
+
+tr.sel {
+  background: var(--blue-bg);
+}
+
+input[type="number"],
+input[type="datetime-local"] {
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  min-width: 0;
 }

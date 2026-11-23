@@ -95,6 +95,81 @@ export type OSInfo = {
   shards: { index: string; shard: string; prirep: string; state: string; docs: string; node: string }[] | null;
 };
 
+// ---------- bank (service bank, /api/bank/*) ----------
+
+export type Cabang = { id: number; kode: string; nama: string; kota: string; wilayah: string };
+
+export type Nasabah = {
+  id: string;
+  cif: string;
+  nama: string;
+  nik: string | null;
+  no_hp: string | null;
+  email: string | null;
+  kota: string | null;
+  segmen: string;
+  cabang_id: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type Rekening = {
+  id: string;
+  no_rekening: string;
+  nasabah_id: string;
+  jenis: string;
+  saldo: number;
+  status: string;
+  cabang_id: number | null;
+  dibuka_at: string;
+  nama?: string;
+  cif?: string;
+};
+
+export type Transaksi = {
+  id: string;
+  rekening_id: string;
+  cabang_id: number | null;
+  kanal: string;
+  jenis: string;
+  nominal: number;
+  saldo_setelah: number;
+  occurred_at: string;
+  created_at: string;
+  ref_order_id: string | null;
+  transfer_id: string | null;
+  akad_id: string | null;
+  keterangan: string;
+  request_id: string;
+  no_rekening?: string;
+  nama?: string;
+};
+
+export type Akad = {
+  id: string;
+  nasabah_id: string;
+  rekening_id: string | null;
+  kode_akad: string;
+  pokok: number;
+  margin: number;
+  tenor_bulan: number;
+  status: string;
+  terbayar: number;
+  diajukan_at: string;
+  cair_at: string | null;
+};
+
+export type Ringkasan = {
+  nasabah: number;
+  rekening: number;
+  total_saldo: number;
+  transaksi: number;
+  outbox_pending: number;
+  akad: Record<string, number>;
+  stream?: { name: string; messages: number; bytes: number };
+  kode_akad_valid: Record<string, string>;
+};
+
 export async function getJSON<T>(path: string): Promise<T> {
   const r = await fetch(gw(path), { cache: "no-store" });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -104,6 +179,17 @@ export async function getJSON<T>(path: string): Promise<T> {
 export async function postJSON<T = unknown>(path: string, body: unknown): Promise<T> {
   const r = await fetch(gw(path), { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
   return (await r.json()) as T;
+}
+
+export async function sendJSON<T = unknown>(method: string, path: string, body: unknown, headers: Record<string, string> = {}): Promise<{ status: number; body: T }> {
+  const r = await fetch(gw(path), { method, body: JSON.stringify(body), headers: { "content-type": "application/json", ...headers } });
+  let b: unknown = {};
+  try {
+    b = await r.json();
+  } catch {
+    b = { error: "respons bukan JSON" };
+  }
+  return { status: r.status, body: b as T };
 }
 
 // usePoll memanggil path setiap ms milidetik; refresh() memaksa panggilan segera.

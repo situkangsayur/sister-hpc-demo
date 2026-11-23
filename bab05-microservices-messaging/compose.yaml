@@ -17,9 +17,24 @@ x-health: &health
 services:
   postgres:
     image: postgres:16-alpine
+    # wal_level=logical + slot/sender cukup untuk Debezium (CDC mata kuliah Data Engineering:
+    # dua slot, database bank dan orders, plus cadangan). Tidak mengubah perilaku demo Bab 5.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_slot_wal_keep_size=1024MB
     environment:
       POSTGRES_USER: sister
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      # Role replikasi untuk Debezium dibuat oleh postgres/02-debezium.sh saat volume baru.
+      DEBEZIUM_USER: ${DEBEZIUM_USER:-debezium}
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:-changeme-debezium}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres:/docker-entrypoint-initdb.d:ro
@@ -98,6 +113,17 @@ services:
     environment:
       NATS_URL: nats://nats:4222
       DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/payment
+      BANK_URL: http://bank:8081
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      <<: *health
+
+  bank:
+    <<: *go
+    command: ["bank"]
+    environment:
+      NATS_URL: nats://nats:4222
+      DATABASE_URL: postgres://sister:${POSTGRES_PASSWORD:-changeme}@postgres:5432/bank
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       <<: *health
@@ -169,6 +195,7 @@ services:
       catalog: { condition: service_healthy }
       inventory: { condition: service_healthy }
       monitor: { condition: service_healthy }
+      bank: { condition: service_healthy }
     ports: ["${BIND_ADDR:-127.0.0.1}:50501:9080"]
 
   ui:

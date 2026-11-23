@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Bab 5 · Toko Daring Microservices",
+  title: "Bab 5 · Toko Daring + Bank Syariah",
   description: "Demo microservices dan messaging: APISIX, nginx, NATS JetStream, saga, circuit breaker, OpenSearch",
 };
 

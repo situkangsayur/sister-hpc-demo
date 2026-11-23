@@ -61,6 +61,39 @@ func EnsureStream(ctx context.Context, js jetstream.JetStream, name string, subj
 	return err
 }
 
+// EnsureStreamRetention sama dengan EnsureStream tetapi dengan masa simpan dan batas ukuran
+// sendiri. Dipakai stream BANK yang juga dibaca pipeline Data Engineering (perlu retensi lebih lama).
+func EnsureStreamRetention(ctx context.Context, js jetstream.JetStream, name string, subjects []string,
+	maxAge time.Duration, maxBytes int64) error {
+	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name: name, Subjects: subjects, Storage: jetstream.FileStorage,
+		Duplicates: 2 * time.Minute, MaxAge: maxAge, MaxBytes: maxBytes,
+	})
+	return err
+}
+
+// Envelope adalah bentuk payload event domain yang dibaca pipeline lain (kontrak data DE):
+// event_id sama dengan id outbox dan dipakai sebagai header Nats-Msg-Id.
+type Envelope struct {
+	EventID    string    `json:"event_id"`
+	EventType  string    `json:"event_type"`
+	OccurredAt time.Time `json:"occurred_at"`
+	Data       any       `json:"data"`
+}
+
+// EnqueueEvent menyimpan event berbentuk Envelope ke outbox. event_id = id outbox, sehingga
+// relay menerbitkannya dengan Nats-Msg-Id = event_id (dedup di JetStream dan di consumer).
+func EnqueueEvent(ctx context.Context, tx pgx.Tx, subject string, occurredAt time.Time, data any) (string, error) {
+	id := NewID()
+	b, err := json.Marshal(Envelope{EventID: id, EventType: subject, OccurredAt: occurredAt.UTC(), Data: data})
+	if err != nil {
+		return "", err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO outbox (id, subject, payload, request_id) VALUES ($1,$2,$3,$4)`,
+		id, subject, b, RequestID(ctx))
+	return id, err
+}
+
 // Audit menerbitkan catatan aktivitas consumer ke subject audit.<service> (core NATS,
 // at-most-once). Monitor memakainya untuk timeline; hilang satu tidak masalah.
 func Audit(nc *nats.Conn, service string, fields map[string]any) {

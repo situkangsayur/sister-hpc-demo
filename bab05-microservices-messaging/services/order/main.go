@@ -54,8 +54,16 @@ func main() {
 		  status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '',
 		  served_by TEXT NOT NULL, precheck TEXT NOT NULL DEFAULT '',
 		  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+		// Bayar dari rekening bank (kosong = kartu). Kolom tambahan, aman untuk data lama.
+		`ALTER TABLE orders ADD COLUMN IF NOT EXISTS no_rekening TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS order_history (id BIGSERIAL PRIMARY KEY, order_id TEXT NOT NULL,
-		  status TEXT NOT NULL, note TEXT NOT NULL, by_replica TEXT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		  status TEXT NOT NULL, note TEXT NOT NULL, by_replica TEXT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+		// Publication untuk Debezium (CDC mata kuliah Data Engineering).
+		`DO $$ BEGIN
+		  IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'dbz_orders') THEN
+		    CREATE PUBLICATION dbz_orders FOR TABLE orders, order_history;
+		  END IF;
+		END $$`); err != nil {
 		log.Error("migrate", "err", err)
 		return
 	}
@@ -157,6 +165,7 @@ type order struct {
 	Items     []platform.Item `json:"items"`
 	Total     int             `json:"total"`
 	Card      string          `json:"card"`
+	NoRek     string          `json:"no_rekening"`
 	Status    string          `json:"status"`
 	Reason    string          `json:"reason"`
 	RequestID string          `json:"request_id"`
@@ -166,13 +175,13 @@ type order struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
-const orderCols = `id, customer, items, total, card, status, reason, request_id, served_by, precheck, created_at, updated_at`
+const orderCols = `id, customer, items, total, card, status, reason, request_id, served_by, precheck, created_at, updated_at, no_rekening`
 
 func scanOrder(row pgx.Row) (order, error) {
 	var o order
 	var items []byte
 	err := row.Scan(&o.ID, &o.Customer, &items, &o.Total, &o.Card, &o.Status, &o.Reason, &o.RequestID,
-		&o.ServedBy, &o.Precheck, &o.CreatedAt, &o.UpdatedAt)
+		&o.ServedBy, &o.Precheck, &o.CreatedAt, &o.UpdatedAt, &o.NoRek)
 	_ = json.Unmarshal(items, &o.Items)
 	return o, err
 }
@@ -186,6 +195,8 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Customer string          `json:"customer"`
 		Items    []platform.Item `json:"items"`
 		Card     string          `json:"card"`
+		// NoRekening: bayar dari rekening bank (service bank). Kosong = mode kartu lama.
+		NoRekening string `json:"no_rekening"`
 	}
 	if err := platform.ReadJSON(r, &in); err != nil || len(in.Items) == 0 || len(in.Items) > 10 {
 		platform.WriteJSON(w, 400, map[string]any{"error": "body harus berisi 1-10 items"})
@@ -194,7 +205,11 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if in.Customer == "" {
 		in.Customer = "pembeli-demo"
 	}
-	if in.Card != "declined" {
+	in.NoRekening = strings.TrimSpace(in.NoRekening)
+	switch {
+	case in.NoRekening != "":
+		in.Card = "rekening"
+	case in.Card != "declined":
 		in.Card = "ok"
 	}
 	key := r.Header.Get("Idempotency-Key")
@@ -265,7 +280,7 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Satu transaksi lokal: pesanan PENDING + riwayat + event di outbox (T1).
-	o := order{ID: "ord-" + platform.NewID()[:8], Customer: in.Customer, Items: in.Items, Total: total, Card: in.Card,
+	o := order{ID: "ord-" + platform.NewID()[:8], Customer: in.Customer, Items: in.Items, Total: total, Card: in.Card, NoRek: in.NoRekening,
 		Status: StatusPending, RequestID: platform.RequestID(ctx), ServedBy: a.replica, Precheck: precheck}
 	var keyArg any
 	if key != "" {
@@ -273,8 +288,8 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	err = platform.InTx(ctx, a.db, func(tx pgx.Tx) error {
 		items, _ := json.Marshal(o.Items)
-		if _, err := tx.Exec(ctx, `INSERT INTO orders (id, idempotency_key, customer, items, total, card, status, request_id, served_by, precheck)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, o.ID, keyArg, o.Customer, items, o.Total, o.Card, o.Status, o.RequestID, o.ServedBy, o.Precheck); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO orders (id, idempotency_key, customer, items, total, card, status, request_id, served_by, precheck, no_rekening)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, o.ID, keyArg, o.Customer, items, o.Total, o.Card, o.Status, o.RequestID, o.ServedBy, o.Precheck, o.NoRek); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO order_history (order_id, status, note, by_replica) VALUES ($1,$2,$3,$4)`,
@@ -282,7 +297,7 @@ func (a *app) handleCreate(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		_, err := platform.Enqueue(ctx, tx, platform.SubjOrderCreated, platform.OrderEvent{OrderID: o.ID,
-			Customer: o.Customer, Items: o.Items, Total: o.Total, Card: o.Card})
+			Customer: o.Customer, Items: o.Items, Total: o.Total, Card: o.Card, NoRekening: o.NoRek})
 		return err
 	})
 	var pgErr *pgconn.PgError

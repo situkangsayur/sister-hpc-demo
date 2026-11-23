@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { gw, Item, Product, rupiah, SearchResult, Stock, usePoll } from "../lib";
+import { gw, Item, Product, Rekening, rupiah, SearchResult, Stock, usePoll } from "../lib";
 
 type CheckoutResult = {
   status: number;
@@ -26,6 +26,7 @@ export default function Storefront({ onOrder }: { onOrder: (id: string) => void 
   const [lastKey, setLastKey] = useState("");
   const [busy, setBusy] = useState(false);
   const stock = usePoll<Stock[]>("monitor/stock", 2000);
+  const rekening = usePoll<Rekening[]>("bank/rekening?limit=60", 3000);
 
   const search = async (query: string) => {
     const r = await fetch(gw(`catalog/search?q=${encodeURIComponent(query)}`), { cache: "no-store" });
@@ -49,7 +50,10 @@ export default function Storefront({ onOrder }: { onOrder: (id: string) => void 
     const r = await fetch(gw(`orders${noauth ? "?noauth=1" : ""}`), {
       method: "POST",
       headers: { "content-type": "application/json", "idempotency-key": key },
-      body: JSON.stringify({ customer: "mahasiswa", items, card }),
+      // card "rek:<no>" = bayar dari rekening bank (payment memanggil service bank).
+      body: JSON.stringify(
+        card.startsWith("rek:") ? { customer: "mahasiswa", items, no_rekening: card.slice(4) } : { customer: "mahasiswa", items, card },
+      ),
     });
     let body: Record<string, unknown> = {};
     try {
@@ -135,10 +139,17 @@ export default function Storefront({ onOrder }: { onOrder: (id: string) => void 
       </div>
       <div className="row wrap">
         <label>
-          kartu&nbsp;
+          bayar&nbsp;
           <select value={card} onChange={(e) => setCard(e.target.value)}>
-            <option value="ok">valid</option>
-            <option value="declined">ditolak bank (saga gagal di T3)</option>
+            <option value="ok">kartu valid</option>
+            <option value="declined">kartu ditolak bank (saga gagal di T3)</option>
+            {(rekening.data ?? [])
+              .filter((k) => k.jenis !== "deposito_mudharabah")
+              .map((k) => (
+                <option key={k.id} value={`rek:${k.no_rekening}`}>
+                  rekening {k.no_rekening} · {k.nama} · saldo {rupiah(k.saldo)}
+                </option>
+              ))}
           </select>
         </label>
         <button
